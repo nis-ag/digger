@@ -812,8 +812,10 @@ func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]required
 	}
 
 	// GraphQL lives at a different path than the REST base URL (which go-github's Client
-	// already has configured, including for GitHub Enterprise Server): api.github.com/graphql
-	// for github.com, or https://HOSTNAME/api/graphql for GHES (REST base ends .../api/v3/).
+	// already has configured): api.github.com/graphql for github.com, or
+	// https://HOSTNAME/api/graphql for GHES (REST base ends .../api/v3/). The github.com case
+	// is confirmed against a live workflow run; the GHES case follows from the URL structure
+	// but has not been tested against a real GHES instance.
 	graphqlURL := strings.TrimSuffix(svc.Client.BaseURL.String(), "v3/") + "graphql"
 
 	req, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(body))

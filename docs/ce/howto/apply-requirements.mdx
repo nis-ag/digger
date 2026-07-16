@@ -45,6 +45,19 @@ the aggregate checks as required:
 These checks only become selectable in this list after they've been posted to the repo at
 least once - trigger a `digger plan` on any PR first if you don't see them yet.
 
+<Note>
+  If you're on a self-hosted backend, see the "Re-installing or replacing the GitHub App"
+  section on [GitHub App Setup](/self-hosting/github-app-setup) before doing a blue/green or
+  other re-installation deployment - a required check pinned to the old installation's app ID
+  will silently block merges after the cutover.
+</Note>
+
+<Note>
+  Mergeability checks use the GitHub GraphQL API. This is confirmed working against
+  github.com; on GitHub Enterprise Server it should work the same way but has not been
+  tested against a real GHES instance.
+</Note>
+
 ### Usage
 
 You can enable the mergeable requirement on the project level:
