@@ -24,13 +24,11 @@ Here is an explanation of each:
 The mergeable requirement will prevent applies unless a pull request is able to be merged.
 In GitHub, if you're not using Protected Branches then all pull requests are mergeable unless there is a conflict.
 
-<Note>
-    If `digger/apply` is itself a required status check, and the PR is blocked *only* by
-    `digger/apply` (every other required check is passing, including any with a `neutral` or
-    `skipped` conclusion), Digger proceeds with the apply anyway - it doesn't require
-    `skip_merge_check` to do so. `skip_merge_check` remains available below if you want to
-    disable the mergeable check entirely for other reasons.
-</Note>
+If `digger/apply` is itself a required status check, and the PR is blocked *only* by
+`digger/apply` (every other required check is passing, including any with a `neutral` or
+`skipped` conclusion), Digger proceeds with the apply anyway - it doesn't require
+`skip_merge_check` to do so. `skip_merge_check` remains available below if you want to
+disable the mergeable check entirely for other reasons.
 
 ### Usage
 
