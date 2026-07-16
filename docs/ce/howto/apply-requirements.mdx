@@ -25,14 +25,11 @@ The mergeable requirement will prevent applies unless a pull request is able to 
 In GitHub, if you're not using Protected Branches then all pull requests are mergeable unless there is a conflict.
 
 <Note>
-    Setting `digger/apply` as a required status check on GitHub used to conflict with the
-    mergeable requirement (see [#1180](https://github.com/diggerhq/digger/issues/1180)):
-    GitHub reports the PR as blocked until `digger/apply` passes, but `digger/apply` can't
-    pass until apply actually runs. This is now handled automatically - if the PR is blocked
-    *only* by `digger/apply` itself (every other required check, including any with a
-    `neutral` or `skipped` conclusion, is passing), Digger proceeds with the apply anyway. You
-    no longer need `skip_merge_check` to work around this specific case; it remains available
-    below if you want to disable the mergeable check entirely for other reasons.
+    If `digger/apply` is itself a required status check, and the PR is blocked *only* by
+    `digger/apply` (every other required check is passing, including any with a `neutral` or
+    `skipped` conclusion), Digger proceeds with the apply anyway - it doesn't require
+    `skip_merge_check` to do so. `skip_merge_check` remains available below if you want to
+    disable the mergeable check entirely for other reasons.
 </Note>
 
 ### Usage
