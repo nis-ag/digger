@@ -746,6 +746,9 @@ func (svc GithubService) isBlockedOnlyByDiggerApply(headSHA string) (bool, error
 		if run.GetConclusion() == "success" {
 			continue
 		}
+		if run.GetConclusion() == "skipped" {
+			continue
+		}
 		if strings.HasPrefix(run.GetName(), "digger/apply") {
 			continue
 		}
