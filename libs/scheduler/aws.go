@@ -9,6 +9,9 @@ import (
 	"net/http"
 	url2 "net/url"
 	"os"
+	"path/filepath"
+	"strings"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -77,19 +80,52 @@ func getAwsConfig(ctx context.Context, region string) (aws.Config, error) {
 	return defaultLoadConfig(ctx, config.WithRegion(region))
 }
 
-func populateretrieveBackendConfigArgs(provider stscreds.WebIdentityRoleProvider) ([]string, error) {
+// stateCredentialsProfile is the AWS shared-credentials profile name the state role's keys are
+// written under. Only this name ends up in the terraform backend configuration, which terraform
+// persists into .terraform/terraform.tfstate and from there into saved plan files - and a saved
+// plan's backend configuration is what `apply <planfile>` configures the backend from, ignoring
+// whatever the apply-time `init` was given. Writing the keys themselves there meant an apply
+// always used the *plan-time* STS session, so applies failed with ExpiredToken once the plan was
+// older than that session's lifetime (~1h). A profile name never expires; the keys behind it are
+// rewritten on every run.
+func stateCredentialsProfile(projectName string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return '-'
+	}, projectName)
+	return "digger-state-" + sanitized
+}
+
+// writeStateCredentialsFile writes creds as a single named profile to its own shared-credentials
+// file and returns the path. The path travels to terraform in the environment rather than in the
+// backend configuration, so it is re-resolved on every run instead of being frozen into the plan.
+func writeStateCredentialsFile(profile string, creds aws.Credentials) (string, error) {
+	path := filepath.Join(os.TempDir(), profile+"-credentials")
+	contents := fmt.Sprintf("[%v]\naws_access_key_id = %v\naws_secret_access_key = %v\naws_session_token = %v\n",
+		profile, creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken)
+	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+		return "", fmt.Errorf("could not write state credentials file %v: %v", path, err)
+	}
+	return path, nil
+}
+
+func populateretrieveBackendConfigArgs(projectName string, provider stscreds.WebIdentityRoleProvider) ([]string, string, error) {
 	creds, err := provider.Retrieve(context.Background())
-	var args []string
 	if err != nil {
 		slog.Error("Could not retrieve keys from provider", "error", err)
-		return args, fmt.Errorf("populateKeys: Could not retrieve keys from provider %v", err)
+		return nil, "", fmt.Errorf("populateKeys: Could not retrieve keys from provider %v", err)
 	}
-	accessKey := fmt.Sprintf("-backend-config=access_key=%v", creds.AccessKeyID)
-	secretKey := fmt.Sprintf("-backend-config=secret_key=%v", creds.SecretAccessKey)
-	token := fmt.Sprintf("-backend-config=token=%v", creds.SessionToken)
 
-	slog.Debug("Retrieved backend config arguments successfully")
-	return append(args, accessKey, secretKey, token), nil
+	profile := stateCredentialsProfile(projectName)
+	credentialsFile, err := writeStateCredentialsFile(profile, creds)
+	if err != nil {
+		return nil, "", err
+	}
+
+	slog.Debug("Retrieved backend config arguments successfully", "profile", profile)
+	return []string{fmt.Sprintf("-backend-config=profile=%v", profile)}, credentialsFile, nil
 }
 
 func populateKeys(envs map[string]string, provider stscreds.WebIdentityRoleProvider) (map[string]string, error) {
@@ -158,12 +194,26 @@ func (job *Job) AuthBackendConfig() error {
 	if job.StateEnvProvider != nil {
 		slog.Info("Project-level AWS role detected, assuming role for project", "project", job.ProjectName)
 
-		var err error
-		backendConfigArgs, err := populateretrieveBackendConfigArgs(*job.StateEnvProvider)
+		backendConfigArgs, credentialsFile, err := populateretrieveBackendConfigArgs(job.ProjectName, *job.StateEnvProvider)
 		if err != nil {
 			slog.Error("Failed to get keys from role for state", "error", err)
 			return fmt.Errorf("failed to get (state) keys from role: %v", err)
 		}
+
+		// The backend resolves the profile against this file, so every terraform invocation -
+		// including the apply, whose backend configuration comes from the plan file - needs it.
+		// ponytail: this hides any pre-existing shared credentials file from the *provider* too.
+		// Harmless when provider credentials come from AWS_ACCESS_KEY_ID/env (static env keys win
+		// over a shared file, and the command role sets them); merge into the user's existing file
+		// instead if someone turns up relying on a file-based profile for the provider.
+		if job.StateEnvVars == nil {
+			job.StateEnvVars = make(map[string]string)
+		}
+		if job.CommandEnvVars == nil {
+			job.CommandEnvVars = make(map[string]string)
+		}
+		job.StateEnvVars["AWS_SHARED_CREDENTIALS_FILE"] = credentialsFile
+		job.CommandEnvVars["AWS_SHARED_CREDENTIALS_FILE"] = credentialsFile
 
 		if job.PlanStage != nil {
 			// TODO: check that the first step is in fact the terraform "init" step

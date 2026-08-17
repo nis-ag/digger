@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -133,6 +134,27 @@ func TestPopulationForNoAwsRoleToAssumeDoesNotSetValueOfKeys(t *testing.T) {
 	assert.NotContains(t, job.StateEnvVars, "AWS_ACCESS_KEY_ID")
 	assert.NotContains(t, job.StateEnvVars, "AWS_SECRET_ACCESS_KEY")
 	assert.NotContains(t, job.StateEnvVars, "AWS_SESSION_TOKEN")
+}
+
+func TestStateCredentialsProfileSanitizesProjectName(t *testing.T) {
+	assert.Equal(t, "digger-state-my_project-1", stateCredentialsProfile("my_project-1"))
+	// path separators and spaces would break the profile header / file name
+	assert.Equal(t, "digger-state-infra-prod-eu", stateCredentialsProfile("infra/prod eu"))
+}
+
+func TestWriteStateCredentialsFileWritesProfile(t *testing.T) {
+	profile := stateCredentialsProfile("test-project")
+	path, err := writeStateCredentialsFile(profile, aws.Credentials{
+		AccessKeyID:     "KEY",
+		SecretAccessKey: "SECRET",
+		SessionToken:    "TOKEN",
+	})
+	assert.Nil(t, err)
+	t.Cleanup(func() { os.Remove(path) })
+
+	contents, err := os.ReadFile(path)
+	assert.Nil(t, err)
+	assert.Equal(t, "[digger-state-test-project]\naws_access_key_id = KEY\naws_secret_access_key = SECRET\naws_session_token = TOKEN\n", string(contents))
 }
 
 func TestGetCognitoTokenGetsCreds(t *testing.T) {

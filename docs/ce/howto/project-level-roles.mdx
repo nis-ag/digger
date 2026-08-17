@@ -29,6 +29,15 @@ projects:
          aws_role_region: us-east-1
 ```
 
+<Note>
+  The `state` role's credentials are passed to terraform as an AWS shared-credentials profile
+  named `digger-state-<project>`: Digger writes the credentials to a file for each run and adds
+  `-backend-config=profile=digger-state-<project>` to `init`. This overrides any `profile` set in
+  your `backend "s3"` block. Digger previously passed the keys themselves via `-backend-config`,
+  which terraform stores inside saved plan files, so an apply used the credentials from plan time
+  and failed with `ExpiredToken` once the plan was older than the role's session duration.
+</Note>
+
 You can also use project-level assume role with [generated projects](/ce/howto/generate-projects):
 
 ```
