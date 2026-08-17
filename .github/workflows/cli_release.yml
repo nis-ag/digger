@@ -5,6 +5,11 @@ name: release cli
   release:
     types:
       - 'released'
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: false
 
 jobs:
   binary:
@@ -34,4 +39,5 @@ jobs:
           sha256sum: true
           md5sum: false
           asset_name: "digger-cli-Linux-X64"
+          release_tag: ${{ inputs.release_tag }}   # empty on release events → uses triggering tag
           compress_assets: "OFF"

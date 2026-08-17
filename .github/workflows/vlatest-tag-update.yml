@@ -76,3 +76,10 @@ jobs:
               make_latest: 'false'
             });
             core.info(`Created release ${res.data.html_url}`);
+  assets:
+    needs: recreate-vlatest
+    permissions:
+      contents: write
+    uses: ./.github/workflows/cli_release.yml
+    with:
+      release_tag: vLatest
