@@ -1,3 +1,19 @@
+# NIS specifics
+
+**This is a public repo**
+
+1. This only releases the digger ce backend and digger ce cli for linux x64.
+2. How-To release:
+    1. Draft a new release, use the upstream version + -nis-BUILDNR (v0.6.149-nis.5)
+    2. Wait for the artefacts to build
+    3. Execute [Recreate vLatest release from develop](https://github.com/nis-ag/digger/actions/workflows/vlatest-tag-update.yml)
+3. I have never tried to sync with the fork, but this should still work
+4. Everything is unprotected
+
+A list of all changes can be seen on the develop branch.
+
+---
+
 <p align="center">
   <img width="748" height="245" alt="Image" src="https://github.com/user-attachments/assets/13b22a04-4b3b-44fd-b6fe-292afc15ad14" />
   <br/>
