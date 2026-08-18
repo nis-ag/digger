@@ -604,7 +604,7 @@ func reportTerraformPlanOutput(reporter reporting.Reporter, projectId string, pl
 		if planUrl != "" {
 			summary = fmt.Sprintf("Plan output (<a href=%q>full plan</a>)", planUrl)
 		}
-		formatter = reporting.GetTerraformOutputAsCollapsibleComment(summary, true)
+		formatter = reporting.GetTerraformOutputAsCollapsibleComment(summary, false)
 	} else {
 		summary := "Plan output"
 		if planUrl != "" {
