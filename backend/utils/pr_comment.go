@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/diggerhq/digger/libs/ci"
+	"github.com/diggerhq/digger/libs/comment_utils/reporting"
 	"github.com/diggerhq/digger/libs/scheduler"
 )
 
@@ -136,28 +137,6 @@ func UpdateCRComment(cr *CommentReporter, comment string) error {
 	return nil
 }
 
-func trimMessageIfExceedsMaxLength(message string) string {
-
-	const GithubCommentMaxLength = 65536
-
-	if len(message) > GithubCommentMaxLength {
-		slog.Warn("Comment message is too long, trimming",
-			"originalLength", len(message),
-			"maxLength", GithubCommentMaxLength,
-		)
-
-		const footer = "[trimmed]"
-		trimLength := len(message) - GithubCommentMaxLength + len(footer)
-		message = message[:len(message)-trimLength] + footer
-
-		slog.Debug("Trimmed comment message",
-			"newLength", len(message),
-			"trimmedBytes", trimLength,
-		)
-	}
-	return message
-}
-
 func ReportInitialJobsStatus(cr *CommentReporter, jobs []scheduler.Job) error {
 	prNumber := cr.PrNumber
 	prService := cr.PrService
@@ -171,7 +150,7 @@ func ReportInitialJobsStatus(cr *CommentReporter, jobs []scheduler.Job) error {
 
 	message := GetInitialJobSummary(jobs)
 
-	message = trimMessageIfExceedsMaxLength(message)
+	message = reporting.TrimToCommentLimit(message, 0)
 	err := prService.EditComment(prNumber, commentId, message)
 	if err != nil {
 		slog.Error("Failed to update comment with initial jobs status",
@@ -245,7 +224,7 @@ To deploy the next layer, run "digger plan --layer 1". To apply the next layer, 
 And so on. A new commit on the branch will restart this deployment process.
 </details>
 `
-	message = trimMessageIfExceedsMaxLength(message)
+	message = reporting.TrimToCommentLimit(message, 0)
 	err := prService.EditComment(prNumber, commentId, message)
 	if err != nil {
 		slog.Error("Failed to update comment with initial jobs status",

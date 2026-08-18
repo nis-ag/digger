@@ -9,6 +9,7 @@ import (
 
 	"github.com/diggerhq/digger/backend/models"
 	"github.com/diggerhq/digger/libs/ci"
+	"github.com/diggerhq/digger/libs/comment_utils/reporting"
 	orchestrator_scheduler "github.com/diggerhq/digger/libs/scheduler"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -197,14 +198,7 @@ func GenerateRealtimeCommentMessage(jobs []models.DiggerJob, batchType orchestra
 	message += "\n" + formatExampleCommands()
 
 	// Handle comment length limits
-	const GithubCommentMaxLength = 65536
-	if len(message) > GithubCommentMaxLength {
-		slog.Warn("Comment message too long, trimming", "originalLength", len(message), "maxLength", GithubCommentMaxLength)
-		const footer = "\n\n[Message truncated due to length limits]"
-		trimLength := len(message) - GithubCommentMaxLength + len(footer)
-		message = message[:len(message)-trimLength] + footer
-		slog.Debug("Trimmed comment message", "newLength", len(message))
-	}
+	message = reporting.TrimToCommentLimit(message, 0)
 
 	return message, nil
 }

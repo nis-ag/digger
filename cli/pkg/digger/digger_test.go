@@ -218,7 +218,7 @@ type MockPlanStorage struct {
 }
 
 func (m *MockPlanStorage) StorePlanFile(fileContents []byte, artifactName string, fileName string) error {
-	m.Commands = append(m.Commands, RunInfo{"StorePlanFile", artifactName, time.Now()})
+	m.Commands = append(m.Commands, RunInfo{"StorePlanFile", fileName, time.Now()})
 	return nil
 }
 
@@ -303,7 +303,7 @@ func TestCorrectCommandExecutionWhenApplying(t *testing.T) {
 
 	commandStrings := allCommandsInOrderWithParams(terraformExecutor, commandRunner, prManager, lock, planStorage, planPathProvider)
 
-	assert.Equal(t, []string{"RetrievePlan plan", "Init ", "Apply ", "PublishComment 1 <details ><summary>Apply output</summary>\n\n```terraform\n\n```\n</details>", "Run   echo"}, commandStrings)
+	assert.Equal(t, []string{"RetrievePlan plan", "Init ", "Apply ", "PublishComment 1 <details><summary>Apply output</summary>\n\n```terraform\n\n```\n</details>", "Run   echo"}, commandStrings)
 }
 
 func TestCorrectCommandExecutionWhenDestroying(t *testing.T) {
@@ -396,7 +396,7 @@ func TestCorrectCommandExecutionWhenPlanning(t *testing.T) {
 
 	commandStrings := allCommandsInOrderWithParams(terraformExecutor, commandRunner, prManager, lock, planStorage, planPathProvider)
 
-	assert.Equal(t, []string{"Init ", "Plan ", "Show ", "StorePlanFile plan", "Run   echo"}, commandStrings)
+	assert.Equal(t, []string{"Init ", "Plan ", "Show ", "StorePlanFile plan", "StorePlanFile plan.txt", "Run   echo"}, commandStrings)
 }
 
 func allCommandsInOrderWithParams(terraformExecutor *MockTerraformExecutor, commandRunner *MockCommandRunner, prManager *MockPRManager, lock *MockProjectLock, planStorage *MockPlanStorage, planPathProvider *MockPlanPathProvider) []string {

@@ -5,9 +5,33 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/diggerhq/digger/libs/ci"
 )
+
+const GithubCommentMaxLength = 65536
+
+const commentTruncationMarker = "\n\n[output truncated - see the linked full plan or the job logs]"
+
+func TrimToCommentLimit(body string, overhead int) string {
+	budget := GithubCommentMaxLength - overhead
+	length := utf8.RuneCountInString(body)
+	if length <= budget {
+		return body
+	}
+
+	slog.Warn("comment body too long, trimming",
+		"originalLength", length,
+		"maxLength", GithubCommentMaxLength,
+		"overhead", overhead)
+
+	keep := budget - utf8.RuneCountInString(commentTruncationMarker)
+	if keep < 0 {
+		keep = 0
+	}
+	return string([]rune(body)[:keep]) + commentTruncationMarker
+}
 
 type CiReporter struct {
 	CiService         ci.PullRequestService
@@ -143,14 +167,14 @@ func upsertComment(ciService ci.PullRequestService, PrNumber int, report string,
 		}
 	}
 
+	wrapFn := AsComment(reportTitle)
+	if supportsCollapsible {
+		wrapFn = AsCollapsibleComment(reportTitle, false)
+	}
+	overhead := utf8.RuneCountInString(wrapFn(""))
+
 	if commentIdForThisRun == "" {
-		var commentMessage string
-		if !supportsCollapsible {
-			commentMessage = AsComment(reportTitle)(report)
-		} else {
-			commentMessage = AsCollapsibleComment(reportTitle, false)(report)
-		}
-		comment, err := ciService.PublishComment(PrNumber, commentMessage)
+		comment, err := ciService.PublishComment(PrNumber, wrapFn(TrimToCommentLimit(report, overhead)))
 		if err != nil {
 			slog.Error("error publishing comment", "error", err, "prNumber", PrNumber)
 			return "", "", fmt.Errorf("error publishing comment: %v", err)
@@ -165,12 +189,7 @@ func upsertComment(ciService ci.PullRequestService, PrNumber int, report string,
 
 	commentBody = commentBody + "\n\n" + report + "\n"
 
-	var completeComment string
-	if !supportsCollapsible {
-		completeComment = AsComment(reportTitle)(commentBody)
-	} else {
-		completeComment = AsCollapsibleComment(reportTitle, false)(commentBody)
-	}
+	completeComment := wrapFn(TrimToCommentLimit(commentBody, overhead))
 
 	err := ciService.EditComment(PrNumber, commentIdForThisRun, completeComment)
 
@@ -200,7 +219,7 @@ func (strategy LatestRunCommentStrategy) Report(ciService ci.PullRequestService,
 type MultipleCommentsStrategy struct{}
 
 func (strategy MultipleCommentsStrategy) Report(ciService ci.PullRequestService, PrNumber int, report string, reportFormatter func(report string) string, supportsCollapsibleComment bool) (string, string, error) {
-	comment, err := ciService.PublishComment(PrNumber, reportFormatter(report))
+	comment, err := ciService.PublishComment(PrNumber, TrimToCommentLimit(reportFormatter(report), 0))
 	if err != nil {
 		slog.Error("error publishing comment", "error", err, "prNumber", PrNumber)
 		return "", "", err

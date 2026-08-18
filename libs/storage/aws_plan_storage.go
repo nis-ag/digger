@@ -147,6 +147,15 @@ func (psa *PlanStorageAWS) StorePlanFile(fileContents []byte, artifactName, file
 	return nil
 }
 
+func (psa *PlanStorageAWS) StoredPlanUrl(storedPlanFilePath string) string {
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		return fmt.Sprintf("s3://%v/%v", psa.Bucket, storedPlanFilePath)
+	}
+	return fmt.Sprintf("https://%v.console.aws.amazon.com/s3/object/%v?region=%v&prefix=%v",
+		region, psa.Bucket, region, storedPlanFilePath)
+}
+
 func (psa *PlanStorageAWS) RetrievePlan(localPlanFilePath, artifactName, storedPlanFilePath string) (*string, error) {
 	output, err := psa.Client.GetObject(psa.Context, &s3.GetObjectInput{
 		Bucket: aws.String(psa.Bucket),

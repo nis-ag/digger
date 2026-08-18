@@ -1,24 +1,16 @@
 package reporting
 
-import (
-	"fmt"
-)
+func openTag(open bool) string {
+	if open {
+		return ` open="true"`
+	}
+	return ""
+}
 
 func GetTerraformOutputAsCollapsibleComment(summary string, open bool) func(string) string {
-	var openTag string
-	if open {
-		openTag = "open=\"true\""
-	} else {
-		openTag = ""
-	}
-
 	return func(comment string) string {
-		return fmt.Sprintf(`<details %v><summary>`+summary+`</summary>
-
-`+"```terraform"+`
-`+comment+`
-`+"```"+`
-</details>`, openTag)
+		return "<details" + openTag(open) + "><summary>" + summary + "</summary>\n\n" +
+			"```terraform\n" + comment + "\n```\n</details>"
 	}
 }
 
@@ -29,16 +21,8 @@ func GetTerraformOutputAsComment(summary string) func(string) string {
 }
 
 func AsCollapsibleComment(summary string, open bool) func(string) string {
-	var openTag string
-	if open {
-		openTag = "open=\"true\""
-	} else {
-		openTag = ""
-	}
 	return func(comment string) string {
-		return fmt.Sprintf(`<details %v><summary>`+summary+`</summary>
-  `+comment+`
-</details>`, openTag)
+		return "<details" + openTag(open) + "><summary>" + summary + "</summary>\n  " + comment + "\n</details>"
 	}
 }
 

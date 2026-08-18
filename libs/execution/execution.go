@@ -326,6 +326,9 @@ func (d DiggerExecutor) postProcessPlan(stdout string) (string, string, *iac_uti
 		defer file.Close()
 	}
 
+	// TODO: move this function to iacUtils interface and implement for pulumi
+	cleanedUpPlan := cleanupTerraformPlan(stdout)
+
 	if d.PlanStorage != nil {
 		fileBytes, err := os.ReadFile(d.PlanPathProvider.LocalPlanFilePath())
 		if err != nil {
@@ -339,10 +342,13 @@ func (d DiggerExecutor) postProcessPlan(stdout string) (string, string, *iac_uti
 			return "", "", nil, false, fmt.Errorf("error storing artifact file: %v", err)
 
 		}
+
+		err = d.PlanStorage.StorePlanFile([]byte(cleanedUpPlan), d.PlanPathProvider.ArtifactName(), d.PlanPathProvider.StoredPlanFilePath()+".txt")
+		if err != nil {
+			slog.Warn("could not store readable plan for linking", "error", err)
+		}
 	}
 
-	// TODO: move this function to iacUtils interface and implement for pulumi
-	cleanedUpPlan := cleanupTerraformPlan(stdout)
 	return cleanedUpPlan, terraformPlanJsonOutputString, planSummary, isEmptyPlan, nil
 }
 

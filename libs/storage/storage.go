@@ -6,3 +6,7 @@ type PlanStorage interface {
 	DeleteStoredPlan(artifactName string, storedPlanFilePath string) error
 	PlanExists(artifactName string, storedPlanFilePath string) (bool, error)
 }
+
+type PlanUrlProvider interface {
+	StoredPlanUrl(storedPlanFilePath string) string
+}

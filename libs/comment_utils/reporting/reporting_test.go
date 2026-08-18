@@ -34,9 +34,10 @@ func (t MockCiService) PublishComment(prNumber int, comment string) (*ci.Comment
 		}
 	}
 
-	t.CommentsPerPr[prNumber] = append(t.CommentsPerPr[prNumber], &ci.Comment{Id: strconv.Itoa(latestId + 1), Body: &comment})
+	newComment := &ci.Comment{Id: strconv.Itoa(latestId + 1), Body: &comment}
+	t.CommentsPerPr[prNumber] = append(t.CommentsPerPr[prNumber], newComment)
 
-	return nil, nil
+	return newComment, nil
 }
 
 func (t MockCiService) ListIssues() ([]*ci.Issue, error) {

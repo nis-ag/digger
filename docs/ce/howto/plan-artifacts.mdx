@@ -42,6 +42,10 @@ with:
     upload-plan-destination-s3-bucket: 'terraform-plan-output-1239123'
 ```
 
+With S3, Digger uploads a `.txt` copy of the human-readable plan output. The PR
+comment links to it, so you can still read the whole plan when the comment has
+to be trimmed to fit GitHub's character comment limit.
+
 ### Azure 
 You can also use Azure storage accounts to store plan outputs.  
 

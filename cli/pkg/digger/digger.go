@@ -315,7 +315,11 @@ func run(command string, job orchestrator.Job, policyChecker policy.Checker, org
 			return nil, msg, fmt.Errorf("%s", msg)
 		} else if planPerformed {
 			if isNonEmptyPlan {
-				reportTerraformPlanOutput(reporter, projectLock.LockId(), plan)
+				planUrl := ""
+				if urlProvider, ok := planStorage.(storage.PlanUrlProvider); ok {
+					planUrl = urlProvider.StoredPlanUrl(planPathProvider.StoredPlanFilePath() + ".txt")
+				}
+				reportTerraformPlanOutput(reporter, projectLock.LockId(), plan, planUrl)
 
 				planIsAllowed, messages, err := policyChecker.CheckPlanPolicy(SCMrepository, SCMOrganisation, job.ProjectName, job.ProjectDir, requestedBy, teams, approvals, approvalTeams, planJsonOutput)
 				if err != nil {
@@ -592,13 +596,21 @@ func reportApplyMergeabilityError(reporter reporting.Reporter) string {
 	return comment
 }
 
-func reportTerraformPlanOutput(reporter reporting.Reporter, projectId string, plan string) {
+func reportTerraformPlanOutput(reporter reporting.Reporter, projectId string, plan string, planUrl string) {
 	var formatter func(string) string
 
 	if reporter.SupportsMarkdown() {
-		formatter = reporting.GetTerraformOutputAsCollapsibleComment("Plan output", true)
+		summary := "Plan output"
+		if planUrl != "" {
+			summary = fmt.Sprintf("Plan output (<a href=%q>full plan</a>)", planUrl)
+		}
+		formatter = reporting.GetTerraformOutputAsCollapsibleComment(summary, true)
 	} else {
-		formatter = reporting.GetTerraformOutputAsComment("Plan output")
+		summary := "Plan output"
+		if planUrl != "" {
+			summary = "Plan output - full plan: " + planUrl
+		}
+		formatter = reporting.GetTerraformOutputAsComment(summary)
 	}
 
 	_, _, err := reporter.Report(plan, formatter)

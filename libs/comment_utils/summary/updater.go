@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/diggerhq/digger/libs/ci"
+	"github.com/diggerhq/digger/libs/comment_utils/reporting"
 	"github.com/diggerhq/digger/libs/scheduler"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -66,19 +67,7 @@ func (b BasicCommentUpdater) UpdateComment(jobs []scheduler.SerializedJob, prNum
 
 	message = message + "\n" + formatExampleCommands()
 
-	const GithubCommentMaxLength = 65536
-	if len(message) > GithubCommentMaxLength {
-		// TODO: Handle the case where message is too long by trimming
-		slog.Warn("message is too long, trimming",
-			"originalLength", len(message),
-			"maxLength", GithubCommentMaxLength)
-
-		const footer = "[trimmed]"
-		trimLength := len(message) - GithubCommentMaxLength + len(footer)
-		message = message[:len(message)-trimLength] + footer
-
-		slog.Debug("trimmed message", "newLength", len(message))
-	}
+	message = reporting.TrimToCommentLimit(message, 0)
 
 	err = prService.EditComment(prNumber, prCommentId, message)
 	if err != nil {

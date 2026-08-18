@@ -148,3 +148,19 @@ func TestPlanStorageAWS_E2E(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, false, exists)
 }
+
+func TestStoredPlanUrl(t *testing.T) {
+	psa := &PlanStorageAWS{Bucket: "my-plans"}
+
+	t.Setenv("AWS_REGION", "eu-central-1")
+	assert.Equal(t,
+		"https://eu-central-1.console.aws.amazon.com/s3/object/my-plans?region=eu-central-1&prefix=acme-infra-42-vpc.tfplan.txt",
+		psa.StoredPlanUrl("acme-infra-42-vpc.tfplan.txt"))
+
+	t.Setenv("AWS_REGION", "")
+	assert.Equal(t,
+		"s3://my-plans/acme-infra-42-vpc.tfplan.txt",
+		psa.StoredPlanUrl("acme-infra-42-vpc.tfplan.txt"))
+}
+
+var _ PlanUrlProvider = (*PlanStorageAWS)(nil)
