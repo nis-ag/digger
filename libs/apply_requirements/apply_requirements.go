@@ -43,7 +43,7 @@ func CheckApplyRequirements(ghService ci.PullRequestService, impactedProjects []
 			} else if req == digger_config.ApplyRequirementsUndiverged && isDiverged == true {
 				return fmt.Errorf("PR fails apply requirements for project %v, Expected PR to be undiverged from target branch. Merge main into the PR branch or rebase the PR branch on top of main", proj.Name)
 			} else if req == digger_config.ApplyRequirementsMergeable && isMergeable == false && !ignoreMergeability {
-				return fmt.Errorf("PR fails apply requirements for project %v, Expected PR to be mergable. Ensure all status checks are successful in order to proceed", proj.Name)
+				return fmt.Errorf("PR fails apply requirements for project %v, Expected PR to be mergable. Ensure required reviews are in place (an approval from a code owner, where CODEOWNERS review is required) and all status checks are successful in order to proceed", proj.Name)
 			} else {
 				slog.Warn("unknown apply requirements found", "project", proj.Name, "requirement", req)
 			}

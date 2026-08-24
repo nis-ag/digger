@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -743,11 +744,23 @@ type requiredCheckContext struct {
 	IsRequired bool
 }
 
-type statusCheckRollupResponse struct {
+// prMergeState is the part of GitHub's merge box needed to decide whether the only thing
+// standing between a PR and a merge is digger/apply itself.
+type prMergeState struct {
+	// ReviewDecision is GitHub's own verdict on the branch's review requirements — including
+	// "require review from Code Owners", which it evaluates against CODEOWNERS for us. One of
+	// APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or empty when the branch requires no
+	// reviews at all.
+	ReviewDecision string
+	Contexts       []requiredCheckContext
+}
+
+type prMergeStateResponse struct {
 	Data struct {
 		Repository struct {
 			PullRequest struct {
-				Commits struct {
+				ReviewDecision string `json:"reviewDecision"`
+				Commits        struct {
 					Nodes []struct {
 						Commit struct {
 							StatusCheckRollup struct {
@@ -773,17 +786,19 @@ type statusCheckRollupResponse struct {
 	} `json:"errors"`
 }
 
-// getRequiredCheckContextsForPR fetches the PR's statusCheckRollup via GraphQL. Unlike the
+// getPrMergeState fetches the PR's reviewDecision and statusCheckRollup via GraphQL. Unlike the
 // REST check-runs list (GetCheckRunsForCommit), which returns every check-run ever posted to
 // a commit with no way to tell which ones actually gate merging, statusCheckRollup carries a
 // per-context isRequired flag — reflecting the same merge-box view any collaborator can
 // already see, not branch-protection configuration itself, so it doesn't need admin-level
 // access the way GET /branches/{branch}/protection or GraphQL's branchProtectionRules do
-// (both confirmed to return 403/FORBIDDEN for a standard token).
-func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]requiredCheckContext, error) {
+// (both confirmed to return 403/FORBIDDEN for a standard token). reviewDecision is readable
+// on the same terms and covers both classic branch protection and rulesets.
+func (svc GithubService) getPrMergeState(prNumber int) (prMergeState, error) {
 	query := `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      reviewDecision
       commits(last: 1) {
         nodes {
           commit {
@@ -820,7 +835,7 @@ func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]required
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("could not marshal graphql request: %v", err)
+		return prMergeState{}, fmt.Errorf("could not marshal graphql request: %v", err)
 	}
 
 	// GraphQL lives at a different path than the REST base URL (which go-github's Client
@@ -832,27 +847,35 @@ func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]required
 
 	req, err := http.NewRequest("POST", graphqlURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("could not build graphql request: %v", err)
+		return prMergeState{}, fmt.Errorf("could not build graphql request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := svc.Client.Client().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("graphql request failed: %v", err)
+		return prMergeState{}, fmt.Errorf("graphql request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
-	var parsed statusCheckRollupResponse
+	// An auth or permission failure answers with a REST-shaped {"message": ...} body, which
+	// decodes into the response struct without error and with no Errors entries — so without
+	// this check a 401/403 would look like a PR that has nothing blocking it.
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return prMergeState{}, fmt.Errorf("graphql request returned status %v: %v", resp.StatusCode, string(errBody))
+	}
+
+	var parsed prMergeStateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, fmt.Errorf("could not decode graphql response: %v", err)
+		return prMergeState{}, fmt.Errorf("could not decode graphql response: %v", err)
 	}
 	if len(parsed.Errors) > 0 {
-		return nil, fmt.Errorf("graphql errors: %v", parsed.Errors)
+		return prMergeState{}, fmt.Errorf("graphql errors: %v", parsed.Errors)
 	}
 
 	commitNodes := parsed.Data.Repository.PullRequest.Commits.Nodes
 	if len(commitNodes) == 0 {
-		return nil, nil
+		return prMergeState{}, fmt.Errorf("graphql response contained no commits for PR %v", prNumber)
 	}
 
 	var contexts []requiredCheckContext
@@ -869,7 +892,10 @@ func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]required
 			IsRequired: n.IsRequired,
 		})
 	}
-	return contexts, nil
+	return prMergeState{
+		ReviewDecision: strings.ToUpper(parsed.Data.Repository.PullRequest.ReviewDecision),
+		Contexts:       contexts,
+	}, nil
 }
 
 // isBlockedOnlyByDiggerApply returns true if the only *required* status contexts on the PR
@@ -877,17 +903,27 @@ func (svc GithubService) getRequiredCheckContextsForPR(prNumber int) ([]required
 // digger/apply is a required branch protection check: the apply must run to pass the check,
 // but the mergeability gate would otherwise prevent it from running.
 func (svc GithubService) isBlockedOnlyByDiggerApply(prNumber int) (bool, error) {
-	contexts, err := svc.getRequiredCheckContextsForPR(prNumber)
+	state, err := svc.getPrMergeState(prNumber)
 	if err != nil {
-		return false, fmt.Errorf("could not get required check contexts for PR %v: %v", prNumber, err)
+		return false, fmt.Errorf("could not get merge state for PR %v: %v", prNumber, err)
 	}
 
-	return blockedOnlyByDiggerApply(contexts), nil
+	return blockedOnlyByDiggerApply(state), nil
 }
 
 // blockedOnlyByDiggerApply is the pure decision logic behind isBlockedOnlyByDiggerApply,
 // separated out so it can be unit tested without a live GitHub API call.
-func blockedOnlyByDiggerApply(contexts []requiredCheckContext) bool {
+func blockedOnlyByDiggerApply(state prMergeState) bool {
+	// Status check contexts carry nothing about reviews, so a PR blocked purely on a missing
+	// code-owner approval would otherwise look like one blocked only by digger/apply. Deferring
+	// to reviewDecision keeps CODEOWNERS evaluation on GitHub's side, where it belongs — an
+	// approval from someone who is not an owner leaves this at REVIEW_REQUIRED. Empty means the
+	// branch requires no reviews, in which case there is no review gate to respect.
+	if state.ReviewDecision != "" && state.ReviewDecision != "APPROVED" {
+		slog.Debug("PR blocked by review requirements", "reviewDecision", state.ReviewDecision)
+		return false
+	}
+
 	// GitHub's branch protection docs state that a required status check passes with a
 	// "successful, skipped, or neutral" conclusion — not "success" alone:
 	// https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
@@ -899,7 +935,7 @@ func blockedOnlyByDiggerApply(contexts []requiredCheckContext) bool {
 		"NEUTRAL": true,
 	}
 
-	for _, ctx := range contexts {
+	for _, ctx := range state.Contexts {
 		// Only required contexts can block merging at all — matches GitHub's own
 		// mergeable_state calculation. Previously every context on the commit was
 		// evaluated regardless of required-ness, which incorrectly blocked apply on
