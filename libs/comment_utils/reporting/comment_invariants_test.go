@@ -35,12 +35,13 @@ func snippet(s string) string {
 	return string([]rune(s)[:max]) + "…"
 }
 
-func fenceInfoString(line string) (string, bool) {
+func fenceInfoString(line string) (info string, backticks int, ok bool) {
 	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "```") {
-		return "", false
+	backticks = len(trimmed) - len(strings.TrimLeft(trimmed, "`"))
+	if backticks < 3 {
+		return "", 0, false
 	}
-	return strings.TrimSpace(strings.TrimPrefix(trimmed, "```")), true
+	return strings.TrimSpace(trimmed[backticks:]), backticks, true
 }
 
 // Splits body into the content of its ```terraform fences and everything else, which counts
@@ -49,23 +50,25 @@ func fenceInfoString(line string) (string, bool) {
 //
 // Every fence is tracked, not only terraform ones: a ```terraform line sitting inside a
 // ```bash block is bash content, and reading it as an opening fence desynchronises the parse
-// so every later block is misattributed.
+// so every later block is misattributed. Fence length is tracked for the same reason: a bare ```
+// inside a ````-opened block is content, not its closing delimiter.
 func splitTerraformBlocks(body string) (protected []string, tfContents []string) {
 	var current, tfContent []string
 	inFence := false
 	openInfo := ""
+	openBackticks := 0
 
 	for _, line := range strings.Split(body, "\n") {
-		info, isFence := fenceInfoString(line)
+		info, backticks, isFence := fenceInfoString(line)
 		switch {
 		case !inFence && isFence:
-			inFence, openInfo = true, info
+			inFence, openInfo, openBackticks = true, info, backticks
 			current = append(current, line)
 			if info == terraformFenceInfo {
 				protected = append(protected, strings.Join(current, "\n"))
 				current, tfContent = nil, nil
 			}
-		case inFence && isFence && info == "":
+		case inFence && isFence && info == "" && backticks >= openBackticks:
 			inFence = false
 			if openInfo == terraformFenceInfo {
 				tfContents = append(tfContents, strings.Join(tfContent, "\n"))
@@ -88,23 +91,27 @@ func splitTerraformBlocks(body string) (protected []string, tfContents []string)
 
 func fenceDelimiters(body string) (count int, unterminated bool) {
 	inFence := false
+	openBackticks := 0
 	for _, line := range strings.Split(body, "\n") {
-		info, isFence := fenceInfoString(line)
+		info, backticks, isFence := fenceInfoString(line)
 		if !isFence {
 			continue
 		}
-		if inFence && info != "" {
-			continue // an info string inside a fence is content, not a delimiter
+		if inFence {
+			if info != "" || backticks < openBackticks {
+				continue // an info string, or too short a run, is content rather than a delimiter
+			}
+			inFence = false
+		} else {
+			inFence, openBackticks = true, backticks
 		}
 		count++
-		inFence = !inFence
 	}
 	return count, inFence
 }
 
 // Reduces a body to the part that must never shrink: the wrapper stripped the way
-// upsertComment does it, block content replaced by a sentinel, and the first inner line's
-// leading whitespace normalised — re-wrapping on every edit indents it two spaces further.
+// upsertComment does it, with block content replaced by a sentinel.
 func skeleton(body string, supportsCollapsible bool) string {
 	lines := strings.Split(body, "\n")
 	if len(lines) > 1 {
@@ -123,10 +130,7 @@ func skeleton(body string, supportsCollapsible bool) string {
 			pieces = append(pieces, skeletonBlockSentinel)
 		}
 	}
-
-	out := strings.Split(strings.Join(pieces, "\n"), "\n")
-	out[0] = strings.TrimLeft(out[0], " \t")
-	return strings.Join(out, "\n")
+	return strings.Join(pieces, "\n")
 }
 
 // Not usable in the over-prose regime, where fitting the limit and keeping every fence closed
@@ -265,6 +269,24 @@ func TestSplitTerraformBlocks(t *testing.T) {
 			wantBlocks:   []string{"one", "two"},
 			wantProtects: []string{"a\n```terraform", "```\nb\n```terraform", "```\nc"},
 		},
+		{
+			name:         "a bare fence inside a longer terraform fence is content",
+			body:         "a\n````terraform\nplan\n```\nmore plan\n````\nb",
+			wantBlocks:   []string{"plan\n```\nmore plan"},
+			wantProtects: []string{"a\n````terraform", "````\nb"},
+		},
+		{
+			name:         "a longer run closes a shorter fence",
+			body:         "a\n```terraform\nplan\n`````\nb",
+			wantBlocks:   []string{"plan"},
+			wantProtects: []string{"a\n```terraform", "`````\nb"},
+		},
+		{
+			name:         "four backticks are a bare fence, not a fence tagged with a backtick",
+			body:         "````\nnot terraform\n````\ntail",
+			wantBlocks:   nil,
+			wantProtects: []string{"````\nnot terraform\n````\ntail"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -273,6 +295,14 @@ func TestSplitTerraformBlocks(t *testing.T) {
 			assert.Equal(t, tt.wantBlocks, blocks)
 			assert.Equal(t, tt.wantProtects, protected)
 			assert.Len(t, protected, len(blocks)+1)
+
+			// The trimmer carries its own parser; it must implement the same grammar as this
+			// oracle, or the suite validates it against a grammar it does not use. It reports
+			// ok == false on a body that ends inside a fence, where the two deliberately differ.
+			if got, ok := splitFencedBody(tt.body); ok {
+				assert.Equal(t, tt.wantBlocks, got.blocks, "trimmer disagrees on blocks")
+				assert.Equal(t, tt.wantProtects, got.protected, "trimmer disagrees on protected prose")
+			}
 		})
 	}
 }
@@ -300,6 +330,39 @@ func TestSplitTerraformBlocksOnReferenceFixture(t *testing.T) {
 	assert.Contains(t, protected[1], "| update   | `module.opentaco.aws_ecs_service.opentaco`")
 }
 
+func TestTerraformFenceOutrunsItsContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "fence-free plan output", content: "plan\nbody", want: "```"},
+		{name: "empty", content: "", want: "```"},
+		{name: "inline code is not a fence", content: "a `inline` b", want: "```"},
+		{name: "two backticks cannot close a fence", content: "a\n``\nb", want: "```"},
+		{name: "a bare fence", content: "a\n```\nb", want: "````"},
+		{name: "an indented fence, as a heredoc renders it", content: "a\n      ```\nb", want: "````"},
+		{name: "a tagged fence", content: "a\n```json\nb", want: "````"},
+		{name: "the longest run wins", content: "a\n```\nb\n`````\nc\n````\nd", want: "``````"},
+		// elideBlock cuts on a rune boundary, so a mid-line run can end up starting a line.
+		{name: "a run in the middle of a line", content: "a\nfoo ``` bar\nb", want: "````"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, terraformFence(tt.content))
+
+			// The point of the fence: the content must come back out as one block.
+			body := GetTerraformOutputAsCollapsibleComment("s", false)(tt.content)
+			split, ok := splitFencedBody(body)
+			require.True(t, ok, "the wrapped body must parse")
+			require.Len(t, split.blocks, 1)
+			assert.Equal(t, tt.content, split.blocks[0])
+			assert.Equal(t, body, split.join())
+		})
+	}
+}
+
 func TestSkeletonStripsTheWrapperSymmetricallyWithUpsertComment(t *testing.T) {
 	inner := "before\n```terraform\nplan body\n```\nafter"
 
@@ -321,11 +384,16 @@ func TestSkeletonIgnoresBlockContent(t *testing.T) {
 	assert.Equal(t, skeleton(full, true), skeleton(trimmed, true))
 }
 
-func TestSkeletonNormalisesLeadingWhitespaceOfFirstInnerLine(t *testing.T) {
-	once := "<details><summary>t</summary>\n  body\n</details>"
-	thrice := "<details><summary>t</summary>\n      body\n</details>"
+// upsertComment unwraps by dropping the first and last line, so anything else the wrapper adds
+// survives the round trip and accumulates on every edit.
+func TestWrappersUnwrapExactly(t *testing.T) {
+	inner := "before\n```terraform\nplan body\n```\nafter"
 
-	assert.Equal(t, skeleton(once, true), skeleton(thrice, true))
+	collapsible := strings.Split(AsCollapsibleComment("t", false)(inner), "\n")
+	assert.Equal(t, inner, strings.Join(collapsible[1:len(collapsible)-1], "\n"))
+
+	plain := strings.Split(AsComment("t")(inner), "\n")
+	assert.Equal(t, inner, strings.Join(plain[1:], "\n"))
 }
 
 func TestBlockHeadPlusTail(t *testing.T) {

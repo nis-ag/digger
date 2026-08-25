@@ -237,7 +237,7 @@ func TestReferenceAccumulationKeepsEveryProtectedReport(t *testing.T) {
 
 	for _, want := range []string{
 		"<summary>plan for shared-services ",
-		`?prefix=example-sharedservices-account-134-shared-services.tfplan.txt">full plan</a>`,
+		`&prefix=example-sharedservices-account-134-shared-services.tfplan.txt">full plan</a>`,
 		"<details><summary>Terraform plan validation check (shared-services)</summary>",
 		fixtureValidationCheckBody,
 		"<details><summary>Plan summary</summary>",
@@ -385,6 +385,80 @@ func TestManyPlansInOneComment(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A resource holding markdown puts a bare ``` inside the plan, because plan output renders a
+// multi-line string attribute as an indented heredoc. $DIGGER_OUT reaches the same fence with the
+// output of any user run step. Before the fence outran its content, the block ended there: the rest
+// of the plan became untrimmable prose, so nothing could shrink and the tail cut took every report
+// after the plan output with it.
+func TestPlanOutputCarryingItsOwnFence(t *testing.T) {
+	heredoc := strings.Join([]string{
+		`  ~ resource "github_repository_file" "readme" {`,
+		`      ~ content = <<-EOT`,
+		`            ## Usage`,
+		"            ```",
+		`            tofu init`,
+		"            ```",
+		`        EOT`,
+		`    }`,
+	}, "\n")
+
+	original := heredoc + "\n\n" + planContentOfSize(t, 2*GithubCommentMaxLength)
+
+	for _, collapsible := range []bool{true, false} {
+		t.Run(wrapperName(collapsible), func(t *testing.T) {
+			svc := newMockCiService()
+			strategy := CommentPerRunStrategy{Title: accumulatingTitle, TimeOfRun: fixedTimeOfRun}
+
+			formatted := replay(t, svc, strategy, planReports(t, "shared-services", original, collapsible), collapsible)
+			body := onlyBody(t, svc, 1)
+
+			assertCommentInvariants(t, body, collapsible)
+			assertProtectedTextSurvives(t, body, formatted)
+			assert.NotContains(t, body, commentTruncationMarker, "the tail cut must not be reached")
+
+			_, blocks := splitTerraformBlocks(body)
+			require.Len(t, blocks, 1, "the plan's own fence must stay inside the block")
+			assertBlockIsHeadPlusTail(t, blocks[0], original)
+			assert.Contains(t, blocks[0], heredoc)
+
+			assert.Contains(t, body, "Plan summary")
+			assert.Contains(t, body, "digger apply -p shared-services")
+		})
+	}
+}
+
+// The first trim of an oversized block keeps exactly minTerraformTailRunes of tail, so a backtick
+// run placed on that boundary starts the surviving tail's first line even though it sits mid-line in
+// the pristine plan. The fence has to outrun every run in the content, not just the ones a line
+// begins with, or the cut manufactures a delimiter the wrapper never accounted for.
+func TestCutCannotExposeABacktickRunThatClosesTheFence(t *testing.T) {
+	// A bare run on its own line: were the fence only three backticks, this would close it.
+	trailing := "```\n" + strings.Repeat("x", minTerraformTailRunes-4)
+	require.Equal(t, minTerraformTailRunes, utf8.RuneCountInString(trailing))
+
+	original := planContentOfSize(t, 2*GithubCommentMaxLength) + " inline " + trailing
+	lines := strings.Split(original, "\n")
+	require.False(t, strings.HasPrefix(strings.TrimSpace(lines[len(lines)-1]), "`"),
+		"the run must sit mid-line, otherwise a line-start scan would already catch it")
+
+	svc := newMockCiService()
+	strategy := CommentPerRunStrategy{Title: accumulatingTitle, TimeOfRun: fixedTimeOfRun}
+	formatted := replay(t, svc, strategy, planReports(t, "shared-services", original, true), true)
+	body := onlyBody(t, svc, 1)
+
+	assertCommentInvariants(t, body, true)
+	assertProtectedTextSurvives(t, body, formatted)
+	assert.NotContains(t, body, commentTruncationMarker, "the tail cut must not be reached")
+
+	_, blocks := splitTerraformBlocks(body)
+	require.Len(t, blocks, 1)
+	assertBlockIsHeadPlusTail(t, blocks[0], original)
+
+	_, tail := splitAtElisionMarker(t, blocks[0])
+	assert.Equal(t, trailing, tail, "the exposed run must stay inside the block")
+	assert.Contains(t, body, "digger apply -p shared-services")
 }
 
 func wrapperName(supportsCollapsible bool) string {

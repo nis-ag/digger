@@ -30,6 +30,13 @@ func TrimToCommentLimit(body string, overhead int) string {
 		"maxLength", GithubCommentMaxLength,
 		"overhead", overhead)
 
+	if trimmed, ok := trimTerraformBlocks(body, budget); ok {
+		return trimmed
+	}
+	return truncateTail(body, budget)
+}
+
+func truncateTail(body string, budget int) string {
 	keep := budget - utf8.RuneCountInString(commentTruncationMarker)
 	if keep < 0 {
 		keep = 0

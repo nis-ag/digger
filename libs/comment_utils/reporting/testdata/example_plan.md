@@ -1,5 +1,5 @@
 <details><summary>plan for shared-services 2026-08-24 10:54:03 (UTC)</summary>
-        <details><summary>Plan output (<a href="https://eu-central-1.console.aws.amazon.com/s3/object/example-plans-bucket?region=eu-central-1&prefix=example-sharedservices-account-134-shared-services.tfplan.txt">full plan</a>)</summary>
+<details><summary>Plan output (<a href="https://eu-central-1.console.aws.amazon.com/s3/object/example-plans-bucket?region=eu-central-1&prefix=example-sharedservices-account-134-shared-services.tfplan.txt">full plan</a>)</summary>
 
 ```terraform
 OpenTofu will perform the following actions:
@@ -44,12 +44,12 @@ details.
 </details>
 
 <details><summary>Terraform plan validation check (shared-services)</summary>
-  Terraform plan validation checks succeeded :white_check_mark:
+Terraform plan validation checks succeeded :white_check_mark:
 </details>
 
 
 <details><summary>Plan summary</summary>
-  
+
 |  CHANGE  |                      RESOURCE                      |
 |----------|----------------------------------------------------|
 | update   | `module.opentaco.aws_ecs_service.opentaco`         |
@@ -59,7 +59,7 @@ details.
 
 
 <details><summary>Instructions</summary>
-  
+
 ▶️ To apply these changes, run the following command:
 
 ```bash
