@@ -10,6 +10,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// The comment title embeds TimeOfRun, so a ticking clock breaks accumulation into one comment.
+var fixedTimeOfRun = time.Date(2026, 8, 24, 10, 54, 3, 0, time.UTC)
+
 func identityFormatter(report string) string {
 	return report
 }
@@ -23,6 +26,11 @@ func onlyBody(t *testing.T, svc MockCiService, prNumber int) string {
 	assert.NoError(t, err)
 	assert.Len(t, comments, 1)
 	return *comments[0].Body
+}
+
+// The per-block floor is head + marker + tail, so rewording the marker changes it.
+func TestTerraformElisionMarkerLength(t *testing.T) {
+	assert.Equal(t, 59, utf8.RuneCountInString(terraformElisionMarker))
 }
 
 func TestTrimToCommentLimitLeavesShortBodyAlone(t *testing.T) {
@@ -54,7 +62,7 @@ func TestTrimToCommentLimitKeepsValidUtf8(t *testing.T) {
 
 func TestCommentPerRunStrategyTrimsOversizedReport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, true)
 	assert.NoError(t, err)
@@ -70,7 +78,7 @@ func TestCommentPerRunStrategyTrimsOversizedReport(t *testing.T) {
 
 func TestCommentPerRunStrategyStaysUnderLimitWhenAccumulating(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	for i := 0; i < 3; i++ {
 		_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength), identityFormatter, true)
@@ -86,7 +94,7 @@ func TestCommentPerRunStrategyStaysUnderLimitWhenAccumulating(t *testing.T) {
 
 func TestLatestRunCommentStrategyTrimsOversizedReport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := LatestRunCommentStrategy{TimeOfRun: time.Now()}
+	strategy := LatestRunCommentStrategy{TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, true)
 	assert.NoError(t, err)
@@ -129,7 +137,7 @@ func TestFormattersDoNotInterpretPercentSequences(t *testing.T) {
 
 func TestCommentPerRunStrategyTrimsReportWithPercentSequences(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("%d", GithubCommentMaxLength), identityFormatter, true)
 	assert.NoError(t, err)
@@ -139,11 +147,29 @@ func TestCommentPerRunStrategyTrimsReportWithPercentSequences(t *testing.T) {
 	assert.NotContains(t, body, "MISSING")
 }
 
+// AsComment only prepends a title, so unwrapping must not strip a trailing line — here the
+// closing fence.
+func TestNonCollapsibleAccumulationKeepsLastLine(t *testing.T) {
+	svc := newMockCiService()
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
+	formatter := GetTerraformOutputAsComment("Plan output")
+
+	for _, plan := range []string{"first plan output", "second plan output"} {
+		_, _, err := strategy.Report(svc, 1, plan, formatter, false)
+		assert.NoError(t, err)
+	}
+
+	body := onlyBody(t, svc, 1)
+	assert.Contains(t, body, "first plan output\n```")
+	assert.Contains(t, body, "second plan output\n```")
+	assert.Equal(t, 4, strings.Count(body, "```"))
+}
+
 // Non-collapsible reporters (bitbucket) have a different wrapper and so a
 // different overhead; the result must still fit.
 func TestCommentPerRunStrategyTrimsWithoutMarkdownSupport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, false)
 	assert.NoError(t, err)
