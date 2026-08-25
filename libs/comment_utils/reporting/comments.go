@@ -9,20 +9,22 @@ func openTag(open bool) string {
 
 func GetTerraformOutputAsCollapsibleComment(summary string, open bool) func(string) string {
 	return func(comment string) string {
+		fence := terraformFence(comment)
 		return "<details" + openTag(open) + "><summary>" + summary + "</summary>\n\n" +
-			"```terraform\n" + comment + "\n```\n</details>"
+			fence + terraformFenceLanguage + "\n" + comment + "\n" + fence + "\n</details>"
 	}
 }
 
 func GetTerraformOutputAsComment(summary string) func(string) string {
 	return func(comment string) string {
-		return summary + "\n```terraform\n" + comment + "\n```"
+		fence := terraformFence(comment)
+		return summary + "\n" + fence + terraformFenceLanguage + "\n" + comment + "\n" + fence
 	}
 }
 
 func AsCollapsibleComment(summary string, open bool) func(string) string {
 	return func(comment string) string {
-		return "<details" + openTag(open) + "><summary>" + summary + "</summary>\n  " + comment + "\n</details>"
+		return "<details" + openTag(open) + "><summary>" + summary + "</summary>\n" + comment + "\n</details>"
 	}
 }
 

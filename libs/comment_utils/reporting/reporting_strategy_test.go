@@ -8,7 +8,11 @@ import (
 
 	"github.com/diggerhq/digger/libs/ci"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// The comment title embeds TimeOfRun, so a ticking clock breaks accumulation into one comment.
+var fixedTimeOfRun = time.Date(2026, 8, 24, 10, 54, 3, 0, time.UTC)
 
 func identityFormatter(report string) string {
 	return report
@@ -54,7 +58,7 @@ func TestTrimToCommentLimitKeepsValidUtf8(t *testing.T) {
 
 func TestCommentPerRunStrategyTrimsOversizedReport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, true)
 	assert.NoError(t, err)
@@ -70,7 +74,7 @@ func TestCommentPerRunStrategyTrimsOversizedReport(t *testing.T) {
 
 func TestCommentPerRunStrategyStaysUnderLimitWhenAccumulating(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	for i := 0; i < 3; i++ {
 		_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength), identityFormatter, true)
@@ -86,7 +90,7 @@ func TestCommentPerRunStrategyStaysUnderLimitWhenAccumulating(t *testing.T) {
 
 func TestLatestRunCommentStrategyTrimsOversizedReport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := LatestRunCommentStrategy{TimeOfRun: time.Now()}
+	strategy := LatestRunCommentStrategy{TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, true)
 	assert.NoError(t, err)
@@ -129,7 +133,7 @@ func TestFormattersDoNotInterpretPercentSequences(t *testing.T) {
 
 func TestCommentPerRunStrategyTrimsReportWithPercentSequences(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("%d", GithubCommentMaxLength), identityFormatter, true)
 	assert.NoError(t, err)
@@ -139,11 +143,51 @@ func TestCommentPerRunStrategyTrimsReportWithPercentSequences(t *testing.T) {
 	assert.NotContains(t, body, "MISSING")
 }
 
+// AsComment only prepends a title, so unwrapping must not strip a trailing line — here the
+// closing fence.
+func TestNonCollapsibleAccumulationKeepsLastLine(t *testing.T) {
+	svc := newMockCiService()
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
+	formatter := GetTerraformOutputAsComment("Plan output")
+
+	for _, plan := range []string{"first plan output", "second plan output"} {
+		_, _, err := strategy.Report(svc, 1, plan, formatter, false)
+		assert.NoError(t, err)
+	}
+
+	body := onlyBody(t, svc, 1)
+	assert.Contains(t, body, "first plan output\n```")
+	assert.Contains(t, body, "second plan output\n```")
+	assert.Equal(t, 4, strings.Count(body, "```"))
+}
+
+// A comment carrying the report title can be hand-edited down to the title alone, leaving no
+// closing line to strip. Unwrapping it must not slice out of range.
+func TestAccumulationIntoASingleLineComment(t *testing.T) {
+	reportTitle := "Digger run report " + fixedTimeOfRun.Format("2006-01-02 15:04:05 (MST)")
+
+	for _, collapsible := range []bool{true, false} {
+		t.Run(wrapperName(collapsible), func(t *testing.T) {
+			svc := newMockCiService()
+			_, err := svc.PublishComment(1, reportTitle)
+			require.NoError(t, err)
+
+			strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
+			_, _, err = strategy.Report(svc, 1, "plan output", identityFormatter, collapsible)
+			require.NoError(t, err)
+
+			body := onlyBody(t, svc, 1)
+			assert.Contains(t, body, reportTitle)
+			assert.Contains(t, body, "plan output")
+		})
+	}
+}
+
 // Non-collapsible reporters (bitbucket) have a different wrapper and so a
 // different overhead; the result must still fit.
 func TestCommentPerRunStrategyTrimsWithoutMarkdownSupport(t *testing.T) {
 	svc := newMockCiService()
-	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: time.Now()}
+	strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
 
 	_, _, err := strategy.Report(svc, 1, strings.Repeat("a", GithubCommentMaxLength*2), identityFormatter, false)
 	assert.NoError(t, err)

@@ -14,6 +14,10 @@ const GithubCommentMaxLength = 65536
 
 const commentTruncationMarker = "\n\n[output truncated - see the linked full plan or the job logs]"
 
+const minTerraformHeadRunes = 500
+const minTerraformTailRunes = 500
+const terraformElisionMarker = "\n\n[... plan output trimmed, see the linked full plan ...]\n\n"
+
 func TrimToCommentLimit(body string, overhead int) string {
 	budget := GithubCommentMaxLength - overhead
 	length := utf8.RuneCountInString(body)
@@ -26,6 +30,13 @@ func TrimToCommentLimit(body string, overhead int) string {
 		"maxLength", GithubCommentMaxLength,
 		"overhead", overhead)
 
+	if trimmed, ok := trimTerraformBlocks(body, budget); ok {
+		return trimmed
+	}
+	return truncateTail(body, budget)
+}
+
+func truncateTail(body string, budget int) string {
 	keep := budget - utf8.RuneCountInString(commentTruncationMarker)
 	if keep < 0 {
 		keep = 0
@@ -182,9 +193,15 @@ func upsertComment(ciService ci.PullRequestService, PrNumber int, report string,
 		return fmt.Sprintf("%v", comment.Id), comment.Url, nil
 	}
 
-	// strip first and last lines
+	// Strip the wrapper added last time: AsCollapsibleComment wraps both sides, AsComment
+	// only prepends a title line. A body edited by hand may be down to the title alone, so
+	// there is not always a closing line to drop.
 	lines := strings.Split(commentBody, "\n")
-	lines = lines[1 : len(lines)-1]
+	if supportsCollapsible && len(lines) > 1 {
+		lines = lines[1 : len(lines)-1]
+	} else {
+		lines = lines[1:]
+	}
 	commentBody = strings.Join(lines, "\n")
 
 	commentBody = commentBody + "\n\n" + report + "\n"
