@@ -8,6 +8,7 @@ import (
 
 	"github.com/diggerhq/digger/libs/ci"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // The comment title embeds TimeOfRun, so a ticking clock breaks accumulation into one comment.
@@ -26,11 +27,6 @@ func onlyBody(t *testing.T, svc MockCiService, prNumber int) string {
 	assert.NoError(t, err)
 	assert.Len(t, comments, 1)
 	return *comments[0].Body
-}
-
-// The per-block floor is head + marker + tail, so rewording the marker changes it.
-func TestTerraformElisionMarkerLength(t *testing.T) {
-	assert.Equal(t, 59, utf8.RuneCountInString(terraformElisionMarker))
 }
 
 func TestTrimToCommentLimitLeavesShortBodyAlone(t *testing.T) {
@@ -163,6 +159,28 @@ func TestNonCollapsibleAccumulationKeepsLastLine(t *testing.T) {
 	assert.Contains(t, body, "first plan output\n```")
 	assert.Contains(t, body, "second plan output\n```")
 	assert.Equal(t, 4, strings.Count(body, "```"))
+}
+
+// A comment carrying the report title can be hand-edited down to the title alone, leaving no
+// closing line to strip. Unwrapping it must not slice out of range.
+func TestAccumulationIntoASingleLineComment(t *testing.T) {
+	reportTitle := "Digger run report " + fixedTimeOfRun.Format("2006-01-02 15:04:05 (MST)")
+
+	for _, collapsible := range []bool{true, false} {
+		t.Run(wrapperName(collapsible), func(t *testing.T) {
+			svc := newMockCiService()
+			_, err := svc.PublishComment(1, reportTitle)
+			require.NoError(t, err)
+
+			strategy := CommentPerRunStrategy{Title: "Digger run report", TimeOfRun: fixedTimeOfRun}
+			_, _, err = strategy.Report(svc, 1, "plan output", identityFormatter, collapsible)
+			require.NoError(t, err)
+
+			body := onlyBody(t, svc, 1)
+			assert.Contains(t, body, reportTitle)
+			assert.Contains(t, body, "plan output")
+		})
+	}
 }
 
 // Non-collapsible reporters (bitbucket) have a different wrapper and so a

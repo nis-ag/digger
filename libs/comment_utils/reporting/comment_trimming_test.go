@@ -150,6 +150,16 @@ func planContentOfSize(t testing.TB, n int) string {
 	return string(runes[len(runes)-n:])
 }
 
+// A plan output that on its own already exceeds the comment limit. Generated rather than stored:
+// a captured plan this size is the reference block repeated some forty times, so the repo would
+// carry 65k runes of test data to say one thing.
+const oversizedPlanRunes = GithubCommentMaxLength + 100
+
+func oversizedPlanOutput(t testing.TB) string {
+	t.Helper()
+	return planContentOfSize(t, oversizedPlanRunes)
+}
+
 func splitAtElisionMarker(t *testing.T, block string) (head, tail string) {
 	t.Helper()
 	require.Equal(t, 1, strings.Count(block, terraformElisionMarker),
@@ -216,9 +226,9 @@ func TestReferenceAccumulationKeepsEveryProtectedReport(t *testing.T) {
 	svc := newMockCiService()
 	strategy := CommentPerRunStrategy{Title: "plan for shared-services", TimeOfRun: fixedTimeOfRun}
 
-	planOutput := strings.TrimSuffix(readFixture(t, "plan_output_shared_services.txt"), "\n")
+	planOutput := oversizedPlanOutput(t)
 	require.Greater(t, utf8.RuneCountInString(planOutput), GithubCommentMaxLength,
-		"the fixture must not fit, otherwise this test asserts nothing about trimming")
+		"the plan output must not fit, otherwise this test asserts nothing about trimming")
 
 	reports := planReports(t, "shared-services", planOutput, true)
 
@@ -429,6 +439,84 @@ func TestPlanOutputCarryingItsOwnFence(t *testing.T) {
 	}
 }
 
+// An indented ```terraform in prose is an indented code block, not a fence. Reading it as one hands
+// the trimmer a block built from protected prose, which it is then free to shrink; and one left
+// unclosed ends the parse inside a fence, which fails the whole body over to the tail cut and takes
+// every report after the plan output with it.
+func TestIndentedFenceInProseIsNotATrimmableBlock(t *testing.T) {
+	// The example has to outgrow the per-block floor. A smaller one is handed back untouched even
+	// when the trimmer does read it as a block, so the test would pass against the bug.
+	pin := `    module "vpc" { version = "3.1.1" }`
+	pinned := strings.TrimSuffix(strings.Repeat(pin+"\n", 2*blockFloor()/utf8.RuneCountInString(pin)), "\n")
+	require.Greater(t, utf8.RuneCountInString(pinned), blockFloor())
+
+	tests := []struct {
+		name    string
+		example string
+	}{
+		{name: "closed", example: "To pin the module, add:\n\n    ```terraform\n" + pinned + "\n    ```"},
+		{name: "unclosed", example: "To pin the module, add:\n\n    ```terraform\n" + pinned},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newMockCiService()
+			strategy := CommentPerRunStrategy{Title: accumulatingTitle, TimeOfRun: fixedTimeOfRun}
+
+			reports := planReports(t, "shared-services", oversizedPlanOutput(t), true)
+			reports[1].body += "\n" + tt.example
+
+			formatted := replay(t, svc, strategy, reports, true)
+			body := onlyBody(t, svc, 1)
+
+			assertCommentInvariants(t, body, true)
+			assertProtectedTextSurvives(t, body, formatted)
+			assert.NotContains(t, body, commentTruncationMarker, "the tail cut must not be reached")
+
+			_, blocks := splitTerraformBlocks(body)
+			require.Len(t, blocks, 1, "only the plan output is a terraform block")
+			assert.Contains(t, body, tt.example, "the indented example is prose and survives verbatim")
+		})
+	}
+}
+
+// A plan echoing a previous digger comment carries the elision marker verbatim, so elideBlock
+// re-splits at a marker it never wrote — here one a few runes in, leaving almost no head. The
+// block must still fill the allocation it was given rather than collapse to a marker plus a tail.
+func TestPlanOutputCarryingTheElisionMarkerVerbatim(t *testing.T) {
+	const echoedHead = "OpenTofu will perform the following actions:"
+
+	pristine := planContentOfSize(t, 2*GithubCommentMaxLength)
+
+	// Both runs report the same prose, so the block is allocated the same budget in each.
+	trimmedBlock := func(t *testing.T, planOutput string) string {
+		t.Helper()
+		svc := newMockCiService()
+		strategy := CommentPerRunStrategy{Title: accumulatingTitle, TimeOfRun: fixedTimeOfRun}
+
+		formatted := replay(t, svc, strategy, planReports(t, "shared-services", planOutput, true)[:1], true)
+		body := onlyBody(t, svc, 1)
+
+		assertCommentInvariants(t, body, true)
+		assertProtectedTextSurvives(t, body, formatted)
+		_, blocks := splitTerraformBlocks(body)
+		require.Len(t, blocks, 1)
+		assertBlockIsHeadPlusTail(t, blocks[0], planOutput)
+		return blocks[0]
+	}
+
+	control := trimmedBlock(t, pristine)
+	echoed := trimmedBlock(t, echoedHead+terraformElisionMarker+pristine)
+
+	assert.Equal(t, utf8.RuneCountInString(control), utf8.RuneCountInString(echoed),
+		"a marker in the plan text must not cost the block any of its allocation")
+
+	head, tail := splitAtElisionMarker(t, echoed)
+	assert.Equal(t, echoedHead, head, "the re-split lands on the literal marker, so the head is short")
+	assert.Greater(t, utf8.RuneCountInString(tail), minTerraformTailRunes,
+		"the head's unused share must go to the tail")
+}
+
 // The first trim of an oversized block keeps exactly minTerraformTailRunes of tail, so a backtick
 // run placed on that boundary starts the surviving tail's first line even though it sits mid-line in
 // the pristine plan. The fence has to outrun every run in the content, not just the ones a line
@@ -469,7 +557,7 @@ func wrapperName(supportsCollapsible bool) string {
 }
 
 func TestTrimmingHoldsAcrossStrategiesAndWrappers(t *testing.T) {
-	planOutput := strings.TrimSuffix(readFixture(t, "plan_output_shared_services.txt"), "\n")
+	planOutput := oversizedPlanOutput(t)
 
 	strategies := []struct {
 		name string
@@ -549,7 +637,7 @@ func TestTrimmingHoldsAcrossStrategiesAndWrappers(t *testing.T) {
 // block that already carries an elision marker.
 func TestRepeatedEditsDoNotErodeSurvivingContent(t *testing.T) {
 	const rounds = 20
-	planOutput := strings.TrimSuffix(readFixture(t, "plan_output_shared_services.txt"), "\n")
+	planOutput := oversizedPlanOutput(t)
 
 	for _, collapsible := range []bool{true, false} {
 		t.Run(wrapperName(collapsible), func(t *testing.T) {

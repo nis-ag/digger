@@ -194,9 +194,10 @@ func upsertComment(ciService ci.PullRequestService, PrNumber int, report string,
 	}
 
 	// Strip the wrapper added last time: AsCollapsibleComment wraps both sides, AsComment
-	// only prepends a title line.
+	// only prepends a title line. A body edited by hand may be down to the title alone, so
+	// there is not always a closing line to drop.
 	lines := strings.Split(commentBody, "\n")
-	if supportsCollapsible {
+	if supportsCollapsible && len(lines) > 1 {
 		lines = lines[1 : len(lines)-1]
 	} else {
 		lines = lines[1:]

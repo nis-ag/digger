@@ -36,7 +36,11 @@ func snippet(s string) string {
 }
 
 func fenceInfoString(line string) (info string, backticks int, ok bool) {
-	trimmed := strings.TrimSpace(line)
+	body := strings.TrimLeft(line, " \t")
+	if indent := line[:len(line)-len(body)]; len(indent) > 3 || strings.Contains(indent, "\t") {
+		return "", 0, false // an indented code block, not a fence
+	}
+	trimmed := strings.TrimSpace(body)
 	backticks = len(trimmed) - len(strings.TrimLeft(trimmed, "`"))
 	if backticks < 3 {
 		return "", 0, false
@@ -114,12 +118,10 @@ func fenceDelimiters(body string) (count int, unterminated bool) {
 // upsertComment does it, with block content replaced by a sentinel.
 func skeleton(body string, supportsCollapsible bool) string {
 	lines := strings.Split(body, "\n")
-	if len(lines) > 1 {
-		if supportsCollapsible {
-			lines = lines[1 : len(lines)-1]
-		} else {
-			lines = lines[1:]
-		}
+	if supportsCollapsible && len(lines) > 1 {
+		lines = lines[1 : len(lines)-1]
+	} else {
+		lines = lines[1:]
 	}
 
 	protected, tfContents := splitTerraformBlocks(strings.Join(lines, "\n"))
@@ -286,6 +288,24 @@ func TestSplitTerraformBlocks(t *testing.T) {
 			body:         "````\nnot terraform\n````\ntail",
 			wantBlocks:   nil,
 			wantProtects: []string{"````\nnot terraform\n````\ntail"},
+		},
+		{
+			name:         "three spaces of indentation still open a fence",
+			body:         "a\n   ```terraform\nplan\n   ```\nb",
+			wantBlocks:   []string{"plan"},
+			wantProtects: []string{"a\n   ```terraform", "   ```\nb"},
+		},
+		{
+			name:         "four spaces of indentation are an indented code block, not a fence",
+			body:         "a\n    ```terraform\nnot a block\n    ```\nb",
+			wantBlocks:   nil,
+			wantProtects: []string{"a\n    ```terraform\nnot a block\n    ```\nb"},
+		},
+		{
+			name:         "a tab indents a whole column stop, so it is an indented code block too",
+			body:         "a\n\t```terraform\nnot a block\n\t```\nb",
+			wantBlocks:   nil,
+			wantProtects: []string{"a\n\t```terraform\nnot a block\n\t```\nb"},
 		},
 	}
 

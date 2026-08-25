@@ -56,7 +56,7 @@ func fuzzSeed(plans, planRunes, proseRunes int) []byte {
 
 func FuzzCommentTrimming(f *testing.F) {
 	f.Add(fuzzSeed(1, utf8.RuneCountInString(fixturePlanBlock(f)), 0))
-	f.Add(fuzzSeed(1, utf8.RuneCountInString(strings.TrimSuffix(readFixture(f, "plan_output_shared_services.txt"), "\n")), 0))
+	f.Add(fuzzSeed(1, oversizedPlanRunes, 0))
 	f.Add(fuzzSeed(maxFuzzPlans, 20000, 0))
 	f.Add(fuzzSeed(maxFuzzPlans, 20000, maxFuzzProseRunes))
 	f.Add([]byte{})

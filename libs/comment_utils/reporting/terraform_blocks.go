@@ -28,9 +28,16 @@ func (f fencedBody) join() string {
 
 // fenceDelimiter parses a line as a code fence delimiter: backticks is the length of its leading
 // backtick run, language the info string after it. Fewer than three backticks delimit nothing, and
-// a run of four is a bare fence rather than a fence tagged with a backtick.
+// neither does a line indented four columns or by a tab, which GitHub reads as an indented code
+// block. The whole run is the delimiter and never part of the language, because an info string
+// cannot contain a backtick — so a line of four backticks parses as a bare four-backtick fence, not
+// as a three-backtick fence whose language is "`".
 func fenceDelimiter(line string) (language string, backticks int, ok bool) {
-	trimmed := strings.TrimSpace(line)
+	body := strings.TrimLeft(line, " \t")
+	if indent := line[:len(line)-len(body)]; len(indent) > 3 || strings.Contains(indent, "\t") {
+		return "", 0, false
+	}
+	trimmed := strings.TrimSpace(body)
 	backticks = len(trimmed) - len(strings.TrimLeft(trimmed, "`"))
 	if backticks < 3 {
 		return "", 0, false
@@ -164,6 +171,11 @@ func trimTerraformBlocks(body string, budget int) (string, bool) {
 // suffix of the plan joined by one terraformElisionMarker. A block that already carries a marker
 // is re-split at it, so a re-trim never nests a second marker and the surviving head and tail
 // stay a prefix and a suffix of the pristine plan.
+//
+// The marker is plain text and plan output is arbitrary, so a plan echoing a previous digger
+// comment carries one verbatim and gets re-split at text it never wrote. That guess is made
+// harmless rather than validated: the marker emitted here always lands at or before a literal one,
+// so later rounds re-split in the same place, and the head gives back the capacity it cannot use.
 func elideBlock(content string, target int) string {
 	runes := []rune(content)
 	markerRunes := utf8.RuneCountInString(terraformElisionMarker)
@@ -182,7 +194,11 @@ func elideBlock(content string, target int) string {
 		tail = []rune(content[i+len(terraformElisionMarker):])
 	}
 
+	// The tail is capped so the head carries the bulk of the plan, then the head gives back what it
+	// cannot fill: a split landing a few runes in would otherwise collapse a 65k block to a marker
+	// plus minTerraformTailRunes.
 	tailKeep := min(minTerraformTailRunes, keep/2, len(tail))
 	headKeep := min(keep-tailKeep, len(head))
+	tailKeep = min(keep-headKeep, len(tail))
 	return string(head[:headKeep]) + terraformElisionMarker + string(tail[len(tail)-tailKeep:])
 }
