@@ -1,12 +1,15 @@
 package models
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/diggerhq/digger/libs/scheduler"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -35,7 +38,8 @@ func setupSuite(tb testing.TB) (func(tb testing.TB), *Database, *Organisation) {
 	// migrate tables
 	err = gdb.AutoMigrate(&Policy{}, &Organisation{}, &Repo{}, &Project{}, &Token{},
 		&User{}, &ProjectRun{}, &GithubAppInstallation{}, &VCSConnection{}, &GithubAppInstallationLink{},
-		&GithubDiggerJobLink{}, &DiggerJob{}, &DiggerJobParentLink{}, &DiggerLock{})
+		&GithubDiggerJobLink{}, &DiggerJob{}, &DiggerJobParentLink{}, &DiggerLock{},
+		&DiggerBatch{}, &DiggerPlanCommentGroup{})
 	if err != nil {
 		panic(err)
 	}
@@ -267,4 +271,149 @@ func TestDiggerLockFunctionalities(t *testing.T) {
 	assert.Equal(t, 2, len(existingLocksAfterDeletion))
 	assert.Equal(t, "org/repo2#dev", existingLocksAfterDeletion[0].Resource)
 	assert.Equal(t, "org/repo2#prod", existingLocksAfterDeletion[1].Resource)
+}
+
+func createTestBatch(t *testing.T) *DiggerBatch {
+	t.Helper()
+	batch, err := DB.CreateDiggerBatch(DiggerVCSGithub, 1, "diggerhq", "digger", "diggerhq/digger", 42,
+		"", "main", scheduler.DiggerCommandPlan, nil, 0, "", true, false, nil, "abc123", nil, nil)
+	require.NoError(t, err)
+	return batch
+}
+
+func TestCreatePlanCommentGroups(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	groups := [][]string{
+		{"alpha", "beta"},
+		{"gamma", "delta"},
+		{"epsilon", "zeta"},
+		{"eta"},
+	}
+	for i, projects := range groups {
+		_, err := DB.CreatePlanCommentGroup(batch.ID, i, fmt.Sprintf("comment-%v", i), projects)
+		require.NoError(t, err)
+	}
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, stored, 4)
+
+	for i, group := range stored {
+		assert.Equal(t, i, group.GroupIndex, "groups must come back in group_index order")
+		assert.Equal(t, fmt.Sprintf("comment-%v", i), group.CommentId)
+
+		var projects []string
+		require.NoError(t, json.Unmarshal(group.Projects, &projects))
+		assert.Equal(t, groups[i], projects)
+	}
+}
+
+func TestCreatePlanCommentGroupsIsIdempotent(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	for range 2 {
+		for i, projects := range [][]string{{"alpha"}, {"beta"}} {
+			_, err := DB.CreatePlanCommentGroup(batch.ID, i, fmt.Sprintf("comment-%v", i), projects)
+			require.NoError(t, err)
+		}
+	}
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Len(t, stored, 2, "a retried webhook must not double-post comment groups")
+}
+
+func TestPlanCommentGroupsOfDifferentBatchesAreIndependent(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	first, second := createTestBatch(t), createTestBatch(t)
+	_, err := DB.CreatePlanCommentGroup(first.ID, 0, "comment-first", []string{"alpha"})
+	require.NoError(t, err)
+	_, err = DB.CreatePlanCommentGroup(second.ID, 0, "comment-second", []string{"alpha"})
+	require.NoError(t, err)
+
+	firstGroups, err := DB.GetPlanCommentGroupsForBatch(first.ID)
+	require.NoError(t, err)
+	require.Len(t, firstGroups, 1)
+	assert.Equal(t, "comment-first", firstGroups[0].CommentId)
+
+	secondGroups, err := DB.GetPlanCommentGroupsForBatch(second.ID)
+	require.NoError(t, err)
+	require.Len(t, secondGroups, 1)
+	assert.Equal(t, "comment-second", secondGroups[0].CommentId)
+}
+
+func TestGetPlanCommentGroupForProject(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	_, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha", "beta"})
+	require.NoError(t, err)
+	_, err = DB.CreatePlanCommentGroup(batch.ID, 1, "comment-1", []string{"gamma", "delta"})
+	require.NoError(t, err)
+
+	group, err := DB.GetPlanCommentGroupForProject(batch.ID, "delta")
+	require.NoError(t, err)
+	require.NotNil(t, group)
+	assert.Equal(t, 1, group.GroupIndex)
+	assert.Equal(t, "comment-1", group.CommentId)
+
+	_, err = DB.GetPlanCommentGroupForProject(batch.ID, "unknown")
+	assert.Error(t, err, "an unknown project must not silently resolve to a group")
+}
+
+func TestClaimRenderAdvancesMonotonically(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
+	require.NoError(t, err)
+	require.NotNil(t, group)
+
+	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
+	require.NoError(t, err)
+	assert.True(t, claimed, "the first render must be allowed to claim")
+
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 4, false)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a render computed from fewer terminal jobs must not overwrite a fresher one")
+
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
+	require.NoError(t, err)
+	assert.False(t, claimed, "re-rendering the same state is redundant work")
+
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 6, false)
+	require.NoError(t, err)
+	assert.True(t, claimed, "a fresher render must be allowed through")
+
+	reloaded, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, reloaded, 1)
+	assert.Equal(t, 6, reloaded[0].RenderedJobCount, "a rejected claim must not move the counter")
+}
+
+func TestClaimRenderForceOverridesTheGuard(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
+	require.NoError(t, err)
+	require.NotNil(t, group)
+
+	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 5, true)
+	require.NoError(t, err)
+	assert.True(t, claimed, "the batch-terminal render is authoritative and must always land")
 }

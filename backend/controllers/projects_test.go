@@ -1,18 +1,27 @@
 package controllers
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"path"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/diggerhq/digger/backend/models"
 	"github.com/diggerhq/digger/backend/utils"
+	"github.com/diggerhq/digger/libs/ci"
+	github_ci "github.com/diggerhq/digger/libs/ci/github"
+	"github.com/diggerhq/digger/libs/comment_utils/reporting"
+	"github.com/diggerhq/digger/libs/digger_config"
 	orchestrator_scheduler "github.com/diggerhq/digger/libs/scheduler"
 	"github.com/google/go-github/v61/github"
 	"github.com/google/uuid"
 	"github.com/migueleliasweb/go-github-mock/src/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAutomergeWhenBatchIsSuccessfulStatus(t *testing.T) {
@@ -165,4 +174,804 @@ func TestCharacterLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReporterTypeForConfig(t *testing.T) {
+	const accumulate = "comment_render_mode: accumulate_plans\nprojects:\n- name: dev\n  dir: .\n"
+	const commentsOff = "reporting:\n  comments_enabled: false\nprojects:\n- name: dev\n  dir: .\n"
+
+	tests := []struct {
+		name      string
+		diggerCfg string
+		command   orchestrator_scheduler.DiggerCommand
+		want      string
+	}{
+		{
+			name:      "the default posts plan comments from the runner",
+			diggerCfg: "projects:\n- name: dev\n  dir: .\n",
+			command:   orchestrator_scheduler.DiggerCommandPlan,
+			want:      "lazy",
+		},
+		{
+			name:      "comments disabled silences the runner",
+			diggerCfg: commentsOff,
+			command:   orchestrator_scheduler.DiggerCommandPlan,
+			want:      "noop",
+		},
+		{
+			name:      "comments disabled silences an apply too",
+			diggerCfg: commentsOff,
+			command:   orchestrator_scheduler.DiggerCommandApply,
+			want:      "noop",
+		},
+		{
+			name:      "accumulate_plans silences the runner on plan, the backend renders instead",
+			diggerCfg: accumulate,
+			command:   orchestrator_scheduler.DiggerCommandPlan,
+			want:      "noop",
+		},
+		{
+			name:      "accumulate_plans leaves an apply to the runner, nothing accumulates that",
+			diggerCfg: accumulate,
+			command:   orchestrator_scheduler.DiggerCommandApply,
+			want:      "lazy",
+		},
+		{
+			name:      "both at once is still noop",
+			diggerCfg: "comment_render_mode: accumulate_plans\nreporting:\n  comments_enabled: false\nprojects:\n- name: dev\n  dir: .\n",
+			command:   orchestrator_scheduler.DiggerCommandPlan,
+			want:      "noop",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config, _, _, err := digger_config.LoadDiggerConfigFromString(tt.diggerCfg, "./")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, reporterTypeForConfig(config, tt.command))
+		})
+	}
+}
+
+func loadTestConfig(t *testing.T, diggerCfg string) *digger_config.DiggerConfig {
+	t.Helper()
+	config, _, _, err := digger_config.LoadDiggerConfigFromString(diggerCfg, "./")
+	require.NoError(t, err)
+	return config
+}
+
+func accumulatePlansConfig(t *testing.T, maxPerComment int) *digger_config.DiggerConfig {
+	t.Helper()
+	return loadTestConfig(t, fmt.Sprintf(
+		"comment_render_mode: accumulate_plans\nreporting:\n  max_plans_per_comment: %v\nprojects:\n- name: dev\n  dir: .\n",
+		maxPerComment))
+}
+
+const accumulatePlansYaml = "comment_render_mode: accumulate_plans\nprojects:\n- name: dev\n  dir: .\n"
+
+func createTestBatchOfType(t *testing.T, prNumber int, batchType orchestrator_scheduler.DiggerCommand, diggerConfig string) *models.DiggerBatch {
+	t.Helper()
+	batch, err := models.DB.CreateDiggerBatch(models.DiggerVCSGithub, 1, "diggerhq", "digger", "diggerhq/digger",
+		prNumber, diggerConfig, "main", batchType, nil, 0, "", true, false, nil, "sha", nil, nil)
+	require.NoError(t, err)
+	return batch
+}
+
+func createTestBatch(t *testing.T, prNumber int) *models.DiggerBatch {
+	t.Helper()
+	return createTestBatchOfType(t, prNumber, orchestrator_scheduler.DiggerCommandPlan, "")
+}
+
+// A batch's PR service is resolved through the installation row matching its repo.
+func registerTestInstallation(t *testing.T) {
+	t.Helper()
+	_, err := models.DB.CreateGithubAppInstallation(1, 1, "diggerhq", 1, "diggerhq/digger")
+	require.NoError(t, err)
+}
+
+// githubProviderRecordingEdits serves the comment edit endpoint and records every body it is sent,
+// keyed by comment id, so the tests can assert on what reached GitHub.
+func githubProviderRecordingEdits(edits map[string]string) *utils.DiggerGithubClientMockProvider {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload github.IssueComment
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &payload)
+		edits[path.Base(r.URL.Path)] = payload.GetBody()
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+
+	provider := &utils.DiggerGithubClientMockProvider{}
+	provider.MockedHTTPClient = mock.NewMockedHTTPClient(
+		mock.WithRequestMatchHandler(mock.PatchReposIssuesCommentsByOwnerByRepoByCommentId, handler),
+	)
+	return provider
+}
+
+func createTestJob(t *testing.T, batch *models.DiggerBatch, projectName string, alias string, status orchestrator_scheduler.DiggerJobStatus, output string) *models.DiggerJob {
+	t.Helper()
+	jobSpec, err := json.Marshal(orchestrator_scheduler.JobJson{ProjectName: projectName, ProjectAlias: alias})
+	require.NoError(t, err)
+
+	job, err := models.DB.CreateDiggerJob(batch.ID, jobSpec, "workflow.yml", nil, nil, "noop", projectName)
+	require.NoError(t, err)
+
+	job.Status = status
+	job.TerraformOutput = output
+	require.NoError(t, models.DB.UpdateDiggerJob(job))
+	return job
+}
+
+func testProjectNames(count int) []string {
+	names := make([]string, count)
+	for i := range names {
+		names[i] = fmt.Sprintf("project-%02d", i)
+	}
+	return names
+}
+
+func bodies(t *testing.T, svc github_ci.MockCiService, prNumber int) []string {
+	t.Helper()
+	comments, err := svc.GetComments(prNumber)
+	require.NoError(t, err)
+
+	out := make([]string, 0, len(comments))
+	for _, comment := range comments {
+		require.NotNil(t, comment.Body)
+		out = append(out, *comment.Body)
+	}
+	return out
+}
+
+func newMockPrService() github_ci.MockCiService {
+	return github_ci.MockCiService{CommentsPerPr: map[int][]*ci.Comment{}}
+}
+
+func TestCreatePlanCommentGroupsPostsOnePlaceholderPerGroup(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(26)
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, groups, 4, "26 projects at 8 per comment is four comments")
+
+	var sizes []int
+	var covered []string
+	for _, group := range groups {
+		var groupProjects []string
+		require.NoError(t, json.Unmarshal(group.Projects, &groupProjects))
+		sizes = append(sizes, len(groupProjects))
+		covered = append(covered, groupProjects...)
+	}
+	assert.Equal(t, []int{8, 8, 8, 2}, sizes)
+	assert.ElementsMatch(t, projects, covered, "every project belongs to exactly one group")
+
+	published := bodies(t, svc, 7)
+	require.Len(t, published, 4, "one placeholder comment per group, posted before any job runs")
+	wantHeaders := []string{
+		"## Digger plan output (plans 1-8 of 26)",
+		"## Digger plan output (plans 9-16 of 26)",
+		"## Digger plan output (plans 17-24 of 26)",
+		"## Digger plan output (plans 25-26 of 26)",
+	}
+	for i, body := range published {
+		assert.Contains(t, body, wantHeaders[i],
+			"every group's header must name the slice of the batch that group covers")
+		assert.Equal(t, sizes[i], strings.Count(body, ":hourglass_flowing_sand:"),
+			"a placeholder lists every project in its group as pending")
+	}
+}
+
+func TestPlanCommentGroupsAreNotCreatedInBasicMode(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	basic := loadTestConfig(t, "projects:\n- name: dev\n  dir: .\n")
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, basic, testProjectNames(26)))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, groups, "existing users must see no change in behaviour")
+	assert.Empty(t, svc.CommentsPerPr[7], "no placeholder comments in basic render mode")
+}
+
+func TestPlanCommentGroupsAreNotCreatedForApplyBatches(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatchOfType(t, 7, orchestrator_scheduler.DiggerCommandApply, accumulatePlansYaml)
+	svc := newMockPrService()
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(4)))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, groups)
+	assert.Empty(t, svc.CommentsPerPr[7],
+		"an apply has no plans to accumulate, and its output does not belong under a plan header")
+}
+
+// GitHub redelivers a webhook whose handler it did not hear back from. Publishing before persisting
+// leaves the PR with a second set of group comments that nothing ever edits or deletes.
+func TestCreatePlanCommentGroupsDoesNotPostTwiceForOneBatch(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(26)
+	config := accumulatePlansConfig(t, 8)
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, config, projects))
+	firstPass := bodies(t, svc, 7)
+	require.Len(t, firstPass, 4)
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, config, projects))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Len(t, groups, 4)
+	assert.Equal(t, firstPass, bodies(t, svc, 7), "a second pass must reuse the comments it already posted")
+}
+
+// A pass that failed part way through leaves some groups posted. Finishing the set must number the
+// groups it adds by their real position in the batch, not by their position among the ones it posts.
+func TestCreatePlanCommentGroupsFinishesAPartlyPostedSet(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(26)
+
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", projects[:8])
+	require.NoError(t, err)
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+
+	published := bodies(t, svc, 7)
+	require.Len(t, published, 3, "the group that was already posted must not be posted again")
+	assert.Contains(t, published[0], "## Digger plan output (plans 9-16 of 26)")
+	assert.Contains(t, published[1], "## Digger plan output (plans 17-24 of 26)")
+	assert.Contains(t, published[2], "## Digger plan output (plans 25-26 of 26)")
+}
+
+func TestCreatePlanCommentGroupsSortsProjectsForDeterministicGroups(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+
+	// Job maps have no stable iteration order, so grouping has to impose one.
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 2),
+		[]string{"delta", "alpha", "charlie", "bravo", "echo"}))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, groups, 3)
+
+	var grouped [][]string
+	for _, group := range groups {
+		var groupProjects []string
+		require.NoError(t, json.Unmarshal(group.Projects, &groupProjects))
+		grouped = append(grouped, groupProjects)
+	}
+	assert.Equal(t, [][]string{{"alpha", "bravo"}, {"charlie", "delta"}, {"echo"}}, grouped)
+}
+
+func planGroupsOfSizes(t *testing.T, sizes ...int) []models.DiggerPlanCommentGroup {
+	t.Helper()
+	groups := make([]models.DiggerPlanCommentGroup, 0, len(sizes))
+	next := 0
+	for groupIndex, size := range sizes {
+		names := make([]string, size)
+		for i := range names {
+			names[i] = fmt.Sprintf("project-%02d", next+i)
+		}
+		serialized, err := json.Marshal(names)
+		require.NoError(t, err)
+		groups = append(groups, models.DiggerPlanCommentGroup{GroupIndex: groupIndex, Projects: serialized})
+		next += size
+	}
+	return groups
+}
+
+func TestPlanGroupOffsetAndTotal(t *testing.T) {
+	groups := planGroupsOfSizes(t, 8, 8, 8, 2)
+
+	for groupIndex, wantOffset := range map[int]int{0: 0, 1: 8, 2: 16, 3: 24} {
+		offset, total, err := planGroupOffsetAndTotal(groups, groupIndex)
+		require.NoError(t, err)
+		assert.Equal(t, wantOffset, offset, "group %v starts after every earlier group's projects", groupIndex)
+		assert.Equal(t, 26, total, "the total counts the whole batch, not the group")
+	}
+}
+
+func TestPlanGroupOffsetAndTotalRejectsAForeignGroup(t *testing.T) {
+	_, _, err := planGroupOffsetAndTotal(planGroupsOfSizes(t, 8, 8), 4)
+	require.Error(t, err, "a group index the batch does not hold must not render as offset zero")
+	assert.Contains(t, err.Error(), "not part of its batch")
+}
+
+// The render claim counts the group's own terminal jobs. Counting the whole batch instead would let
+// one group's progress admit a stale render of another, dropping a plan that already landed.
+func TestStaleRenderIsNotAdmittedByAnotherGroupsProgress(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 2), testProjectNames(4)))
+
+	// The second group finishes while the first is still running.
+	stillRunning := []*models.DiggerJob{
+		createTestJob(t, batch, "project-00", "", orchestrator_scheduler.DiggerJobStarted, ""),
+		createTestJob(t, batch, "project-01", "", orchestrator_scheduler.DiggerJobStarted, ""),
+	}
+	late := createTestJob(t, batch, "project-02", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-02")
+	createTestJob(t, batch, "project-03", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-03")
+
+	second, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-02")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, second, false))
+	require.Equal(t, 2, strings.Count(bodies(t, svc, 7)[1], "```terraform"))
+
+	// Now the first group finishes too, so the batch holds four terminal jobs where the second
+	// group holds two.
+	for _, job := range stillRunning {
+		job.Status = orchestrator_scheduler.DiggerJobSucceeded
+		job.TerraformOutput = "the plan for " + job.ProjectName
+		require.NoError(t, models.DB.UpdateDiggerJob(job))
+	}
+
+	// A render of the second group that read its jobs before the last of them finished.
+	late.Status = orchestrator_scheduler.DiggerJobStarted
+	require.NoError(t, models.DB.UpdateDiggerJob(late))
+
+	reloaded, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-02")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, reloaded, false))
+
+	assert.Equal(t, 2, strings.Count(bodies(t, svc, 7)[1], "```terraform"),
+		"the claim must count this group's terminal jobs, not the batch's")
+}
+
+func TestJobCompletionEditsOnlyItsOwnGroupComment(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(26)
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	// project-09 sits in the second group.
+	createTestJob(t, batch, "project-09", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-09")
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-09")
+	require.NoError(t, err)
+	require.Equal(t, 1, group.GroupIndex)
+
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+	published := bodies(t, svc, 7)
+	require.Len(t, published, 4, "rendering must edit, never post another comment")
+	assert.Contains(t, published[1], "the plan for project-09")
+	assert.Contains(t, published[1], "## Digger plan output (plans 9-16 of 26)",
+		"a re-render must keep naming this group's own slice of the batch")
+	for i, body := range published {
+		if i == 1 {
+			continue
+		}
+		assert.NotContains(t, body, "the plan for project-09",
+			"a job must not touch the comments of other groups")
+	}
+}
+
+func TestJobCompletionsInDifferentGroupsEditDifferentComments(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(26)))
+
+	for _, name := range []string{"project-00", "project-20"} {
+		createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for "+name)
+		group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, name)
+		require.NoError(t, err)
+		require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+	}
+
+	published := bodies(t, svc, 7)
+	require.Len(t, published, 4)
+	assert.Contains(t, published[0], "the plan for project-00")
+	assert.Contains(t, published[2], "the plan for project-20")
+	assert.NotContains(t, published[0], "the plan for project-20")
+	assert.NotContains(t, published[2], "the plan for project-00")
+}
+
+func TestGroupCommentAccumulatesEveryPlanInItsGroup(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(8)))
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+
+	for i, name := range []string{"project-00", "project-01", "project-02"} {
+		createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for "+name)
+		require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+		body := bodies(t, svc, 7)[0]
+		assert.Equal(t, i+1, strings.Count(body, "```terraform"),
+			"each render must carry every plan completed so far, not just the newest")
+	}
+
+	body := bodies(t, svc, 7)[0]
+	for _, name := range []string{"project-00", "project-01", "project-02"} {
+		assert.Contains(t, body, "the plan for "+name)
+	}
+	assert.Equal(t, 5, strings.Count(body, ":hourglass_flowing_sand:"), "the other five are still pending")
+}
+
+func TestStaleRenderDoesNotOverwriteAFresherOne(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(8)))
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+
+	var jobs []*models.DiggerJob
+	for _, name := range []string{"project-00", "project-01", "project-02"} {
+		jobs = append(jobs, createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for "+name))
+	}
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+	require.Equal(t, 3, strings.Count(bodies(t, svc, 7)[0], "```terraform"))
+
+	// Simulate a render that started before the third job finished and only now gets around to
+	// publishing: it sees two terminal jobs where three have already been published.
+	jobs[2].Status = orchestrator_scheduler.DiggerJobStarted
+	require.NoError(t, models.DB.UpdateDiggerJob(jobs[2]))
+
+	reloaded, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, reloaded, false))
+
+	body := bodies(t, svc, 7)[0]
+	assert.Equal(t, 3, strings.Count(body, "```terraform"),
+		"a stale render must not drop a plan that already reached the comment")
+	assert.Contains(t, body, "the plan for project-02")
+}
+
+func TestBatchCompletionRerendersEveryGroup(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(26)
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	for _, name := range projects {
+		createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for "+name)
+	}
+
+	// One intermediate render already claimed the first group at its full count.
+	first, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, first, false))
+
+	require.NoError(t, RenderAllPlanCommentGroups(svc, batch))
+
+	published := bodies(t, svc, 7)
+	require.Len(t, published, 4)
+	for _, name := range projects {
+		assert.Contains(t, strings.Join(published, "\n"), "the plan for "+name,
+			"the render at batch completion is authoritative and must cover every plan")
+	}
+
+	// A comment that drifted after its group was claimed must still be restored.
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.NoError(t, svc.EditComment(7, groups[0].CommentId, "clobbered"))
+	require.NoError(t, RenderAllPlanCommentGroups(svc, batch))
+	assert.Contains(t, bodies(t, svc, 7)[0], "the plan for project-00",
+		"the terminal render must not be blocked by its own earlier claim")
+}
+
+func TestGroupCommentSurvivesOversizedPlans(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	projects := testProjectNames(8)
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	for _, name := range projects {
+		createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded,
+			strings.Repeat("x", reporting.GithubCommentMaxLength))
+	}
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+
+	// The mock rejects an oversized body the way GitHub's 422 does, so an untrimmed render errors.
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+	body := bodies(t, svc, 7)[0]
+	assert.LessOrEqual(t, utf8.RuneCountInString(body), reporting.GithubCommentMaxLength)
+	assert.Equal(t, 8, strings.Count(body, "```terraform"), "every plan must still be represented")
+}
+
+func TestRenderPlanCommentGroupUsesTheProjectAlias(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8),
+		[]string{"customers_bkw_prod"}))
+
+	createTestJob(t, batch, "customers_bkw_prod", "bkw-prod", orchestrator_scheduler.DiggerJobSucceeded, "the plan")
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "customers_bkw_prod")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+	assert.Contains(t, bodies(t, svc, 7)[0], "Plan for bkw-prod")
+}
+
+func TestRenderPlanCommentGroupMarksFailedJobs(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8),
+		[]string{"alpha", "beta"}))
+
+	createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+	createTestJob(t, batch, "beta", "", orchestrator_scheduler.DiggerJobFailed, "")
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "alpha")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+	body := bodies(t, svc, 7)[0]
+	assert.Contains(t, body, "the plan for alpha")
+	assert.Contains(t, body, ":x: **beta** - plan failed, see the job logs")
+}
+
+func TestCommentRenderModeForBatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		diggerConfig string
+		want         string
+	}{
+		{
+			name:         "accumulate_plans is read from the config the batch carries",
+			diggerConfig: accumulatePlansYaml,
+			want:         digger_config.CommentRenderModeAccumulatePlans,
+		},
+		{
+			name:         "a config that does not set the mode means the default",
+			diggerConfig: "projects:\n- name: dev\n  dir: .\n",
+			want:         digger_config.CommentRenderModeBasic,
+		},
+		{
+			name:         "an empty config means the default",
+			diggerConfig: "",
+			want:         digger_config.CommentRenderModeBasic,
+		},
+		{
+			name:         "a config that does not parse means the default",
+			diggerConfig: "projects: [unclosed",
+			want:         digger_config.CommentRenderModeBasic,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, commentRenderModeForBatch(&models.DiggerBatch{DiggerConfig: tt.diggerConfig}))
+		})
+	}
+}
+
+func TestRenderPlanCommentGroupsForJobEditsTheGroupComment(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+	registerTestInstallation(t)
+
+	batch := createTestBatchOfType(t, 7, orchestrator_scheduler.DiggerCommandPlan, accumulatePlansYaml)
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", []string{"alpha", "beta"})
+	require.NoError(t, err)
+
+	job := createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+	createTestJob(t, batch, "beta", "", orchestrator_scheduler.DiggerJobStarted, "")
+
+	edits := map[string]string{}
+	renderPlanCommentGroupsForJob(githubProviderRecordingEdits(edits), batch, job)
+
+	require.Contains(t, edits, "101", "a finished job must rewrite the group comment it belongs to")
+	assert.Contains(t, edits["101"], "the plan for alpha")
+	assert.Contains(t, edits["101"], "## Digger plan output (plans 1-2 of 2)")
+	assert.Contains(t, edits["101"], ":hourglass_flowing_sand: **beta** - pending")
+}
+
+func TestRenderPlanCommentGroupsForJobIsSilentInBasicMode(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+	registerTestInstallation(t)
+
+	batch := createTestBatchOfType(t, 7, orchestrator_scheduler.DiggerCommandPlan, "projects:\n- name: dev\n  dir: .\n")
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", []string{"alpha"})
+	require.NoError(t, err)
+	job := createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+
+	edits := map[string]string{}
+	renderPlanCommentGroupsForJob(githubProviderRecordingEdits(edits), batch, job)
+
+	assert.Empty(t, edits, "the render mode of the batch's own config decides, and it is not accumulate_plans")
+}
+
+func TestRenderPlanCommentGroupsForJobIsSilentForApplyBatches(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+	registerTestInstallation(t)
+
+	batch := createTestBatchOfType(t, 7, orchestrator_scheduler.DiggerCommandApply, accumulatePlansYaml)
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", []string{"alpha"})
+	require.NoError(t, err)
+	job := createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the apply for alpha")
+
+	edits := map[string]string{}
+	renderPlanCommentGroupsForJob(githubProviderRecordingEdits(edits), batch, job)
+
+	assert.Empty(t, edits, "accumulate_plans accumulates plans, an apply keeps the runner's own comments")
+}
+
+func TestRenderPlanCommentGroupsForJobRerendersEveryGroupWhenTheBatchFinishes(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+	registerTestInstallation(t)
+
+	batch := createTestBatchOfType(t, 7, orchestrator_scheduler.DiggerCommandPlan, accumulatePlansYaml)
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", []string{"alpha", "beta"})
+	require.NoError(t, err)
+	_, err = models.DB.CreatePlanCommentGroup(batch.ID, 1, "102", []string{"gamma", "delta"})
+	require.NoError(t, err)
+
+	job := createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+	createTestJob(t, batch, "beta", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for beta")
+	createTestJob(t, batch, "gamma", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for gamma")
+	unfinished := createTestJob(t, batch, "delta", "", orchestrator_scheduler.DiggerJobStarted, "")
+
+	edits := map[string]string{}
+	renderPlanCommentGroupsForJob(githubProviderRecordingEdits(edits), batch, job)
+	assert.NotContains(t, edits, "102", "while the batch runs, a job only touches its own group")
+
+	unfinished.Status = orchestrator_scheduler.DiggerJobSucceeded
+	unfinished.TerraformOutput = "the plan for delta"
+	require.NoError(t, models.DB.UpdateDiggerJob(unfinished))
+
+	edits = map[string]string{}
+	renderPlanCommentGroupsForJob(githubProviderRecordingEdits(edits), batch, unfinished)
+
+	require.Contains(t, edits, "102", "the last job's own group")
+	require.Contains(t, edits, "101", "the batch-terminal pass is authoritative and must cover every group")
+	assert.Contains(t, edits["101"], "the plan for alpha")
+	assert.Contains(t, edits["102"], "the plan for delta")
+}
+
+// The backend never marks a batch failed, only succeeded, so a batch with one failed plan never
+// reaches a terminal status. Completion has to be derived from the jobs instead.
+func TestAllBatchJobsTerminal(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+	createTestJob(t, batch, "beta", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for beta")
+	running := createTestJob(t, batch, "gamma", "", orchestrator_scheduler.DiggerJobStarted, "")
+
+	done, err := allBatchJobsTerminal(batch.ID)
+	require.NoError(t, err)
+	assert.False(t, done, "a running job means the batch is not finished")
+
+	running.Status = orchestrator_scheduler.DiggerJobFailed
+	require.NoError(t, models.DB.UpdateDiggerJob(running))
+
+	done, err = allBatchJobsTerminal(batch.ID)
+	require.NoError(t, err)
+	assert.True(t, done, "a failed job is finished, and the batch status will never say so")
+
+	require.NotEqual(t, orchestrator_scheduler.BatchJobSucceeded, batch.Status,
+		"this is exactly the case batch.Status cannot detect")
+}
+
+func TestDeletePlanCommentGroupsForBatch(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	svc := newMockPrService()
+	older := createTestBatch(t, 7)
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, older, accumulatePlansConfig(t, 2),
+		[]string{"alpha", "beta", "gamma"}))
+
+	// A comment that does not belong to the older batch must survive.
+	unrelated, err := svc.PublishComment(7, "some other comment")
+	require.NoError(t, err)
+
+	require.Len(t, bodies(t, svc, 7), 3, "two group comments plus the unrelated one")
+
+	assert.True(t, deletePlanCommentGroupsForBatch(svc, older))
+
+	comments, err := svc.GetComments(7)
+	require.NoError(t, err)
+	require.Len(t, comments, 1, "every group comment of the older batch must be gone")
+	assert.Equal(t, unrelated.Id, comments[0].Id)
+}
+
+func TestDeletePlanCommentGroupsForBatchWithoutGroups(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	svc := newMockPrService()
+	batch := createTestBatch(t, 7)
+	unrelated, err := svc.PublishComment(7, "some other comment")
+	require.NoError(t, err)
+
+	assert.True(t, deletePlanCommentGroupsForBatch(svc, batch))
+
+	comments, err := svc.GetComments(7)
+	require.NoError(t, err)
+	require.Len(t, comments, 1, "a batch rendered in basic mode has no group comments to delete")
+	assert.Equal(t, unrelated.Id, comments[0].Id)
+}
+
+// DeleteOlderPRCommentsIfEnabled warns about prior comments it could not remove, which it can only do
+// if every delete it drives reports what happened.
+func TestDeletePlanCommentGroupsReportsAFailedDeletion(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+	registerTestInstallation(t)
+
+	batch := createTestBatch(t, 7)
+	_, err := models.DB.CreatePlanCommentGroup(batch.ID, 0, "101", []string{"alpha"})
+	require.NoError(t, err)
+
+	provider := &utils.DiggerGithubClientMockProvider{}
+	provider.MockedHTTPClient = mock.NewMockedHTTPClient(
+		// GitHub answers a comment that is already gone with a 404.
+		mock.WithRequestMatchHandler(mock.DeleteReposIssuesCommentsByOwnerByRepoByCommentId,
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			})),
+	)
+	prService, err := utils.GetPrServiceFromBatch(batch, provider)
+	require.NoError(t, err)
+
+	assert.False(t, deletePlanCommentGroupsForBatch(prService, batch))
 }

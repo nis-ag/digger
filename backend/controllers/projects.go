@@ -1134,6 +1134,10 @@ func (d DiggerController) SetJobStatusForProject(c *gin.Context) {
 		}
 	}
 
+	// A comment that cannot be rendered must not fail a job status update, so every error here is
+	// logged and swallowed.
+	renderPlanCommentGroupsForJob(d.GithubClientProvider, batch, job)
+
 	slog.Info("Checking if PR should be auto-merged", "batchId", batch.ID)
 	err = AutomergePRforBatchIfEnabled(d.GithubClientProvider, batch)
 	if err != nil {
@@ -1768,6 +1772,10 @@ func DeleteOlderPRCommentsIfEnabled(gh utils.GithubClientProvider, batch *models
 				if err != nil {
 					slog.Warn("Could not delete summary comment for batch", "batchId", prBatch.ID, "commentID", *prBatch.CommentId, "error", err)
 				}
+			}
+
+			if !deletePlanCommentGroupsForBatch(prService, &prBatch) {
+				allDeletesSuccessful = false
 			}
 
 			// delete the summary comment

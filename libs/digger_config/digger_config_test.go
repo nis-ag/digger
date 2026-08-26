@@ -1670,3 +1670,103 @@ func TestValidateApplyRequirements(t *testing.T) {
 		})
 	}
 }
+
+func TestMaxPlansPerCommentDefaultsToEight(t *testing.T) {
+	tests := []struct {
+		name      string
+		diggerCfg string
+	}{
+		{
+			name: "no reporting block",
+			diggerCfg: `
+projects:
+- name: dev
+  dir: .
+`,
+		},
+		{
+			name: "reporting block without the key",
+			diggerCfg: `
+reporting:
+  ai_summary: false
+projects:
+- name: dev
+  dir: .
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dg, _, _, err := LoadDiggerConfigFromString(tt.diggerCfg, "./")
+			assert.NoError(t, err)
+			assert.Equal(t, DefaultMaxPlansPerComment, dg.Reporting.MaxPlansPerComment)
+		})
+	}
+}
+
+func TestMaxPlansPerCommentIsRead(t *testing.T) {
+	diggerCfg := `
+reporting:
+  max_plans_per_comment: 3
+projects:
+- name: dev
+  dir: .
+`
+	dg, _, _, err := LoadDiggerConfigFromString(diggerCfg, "./")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, dg.Reporting.MaxPlansPerComment)
+}
+
+func TestAccumulatePlansIsAValidRenderMode(t *testing.T) {
+	diggerCfg := `
+comment_render_mode: accumulate_plans
+projects:
+- name: dev
+  dir: .
+`
+	dg, _, _, err := LoadDiggerConfigFromString(diggerCfg, "./")
+	assert.NoError(t, err)
+	assert.Equal(t, CommentRenderModeAccumulatePlans, dg.CommentRenderMode)
+}
+
+func TestInvalidCommentRenderModeIsStillRejected(t *testing.T) {
+	diggerCfg := `
+comment_render_mode: nonsense
+projects:
+- name: dev
+  dir: .
+`
+	_, _, _, err := LoadDiggerConfigFromString(diggerCfg, "./")
+	assert.ErrorContains(t, err, CommentRenderModeBasic)
+	assert.ErrorContains(t, err, CommentRenderModeGroupByModule)
+	assert.ErrorContains(t, err, CommentRenderModeAccumulatePlans)
+}
+
+func TestMaxPlansPerCommentMustBePositive(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			diggerCfg := `
+reporting:
+  max_plans_per_comment: ` + value + `
+projects:
+- name: dev
+  dir: .
+`
+			_, _, _, err := LoadDiggerConfigFromString(diggerCfg, "./")
+			assert.ErrorContains(t, err, "max_plans_per_comment")
+		})
+	}
+}
+
+func TestAccumulatePlansRequiresTerraformOutputs(t *testing.T) {
+	diggerCfg := `
+comment_render_mode: accumulate_plans
+report_terraform_outputs: false
+projects:
+- name: dev
+  dir: .
+`
+	_, _, _, err := LoadDiggerConfigFromString(diggerCfg, "./")
+	assert.ErrorContains(t, err, "report_terraform_outputs")
+}

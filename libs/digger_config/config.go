@@ -2,6 +2,9 @@ package digger_config
 
 const CommentRenderModeBasic = "basic"
 const CommentRenderModeGroupByModule = "group_by_module"
+const CommentRenderModeAccumulatePlans = "accumulate_plans"
+
+const DefaultMaxPlansPerComment = 8
 
 type AutomergeStrategy string
 
@@ -37,8 +40,9 @@ type DiggerConfig struct {
 }
 
 type ReporterConfig struct {
-	AiSummary       bool
-	CommentsEnabled bool
+	AiSummary          bool
+	CommentsEnabled    bool
+	MaxPlansPerComment int
 }
 
 type DependencyConfiguration struct {

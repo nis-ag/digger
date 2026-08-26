@@ -596,10 +596,7 @@ func handleIssueCommentEvent(gh utils.GithubClientProvider, payload *github.Issu
 	}
 
 
-	reporterType := "lazy"
-	if config.Reporting.CommentsEnabled == false {
-		reporterType = "noop"
-	}
+	reporterType := reporterTypeForConfig(config, *diggerCommand)
 
 	slog.Info("Converting jobs to Digger jobs",
 		"issueNumber", issueNumber,
@@ -668,6 +665,16 @@ func handleIssueCommentEvent(gh utils.GithubClientProvider, payload *github.Issu
 			return fmt.Errorf("error updating digger batch")
 		}
 		slog.Debug("Successfully updated batch with source details", "batchId", batchId)
+	}
+
+	err = CreatePlanCommentGroupsForBatch(ghService, batch, config, lo.Keys(impactedProjectsJobMap))
+	if err != nil {
+		slog.Error("Error creating plan comment groups",
+			"issueNumber", issueNumber,
+			"error", err,
+		)
+		commentReporterManager.UpdateComment(fmt.Sprintf(":x: could not create plan comment groups: %v", err))
+		return fmt.Errorf("error creating plan comment groups: %v", err)
 	}
 
 	slog.Info("Getting CI backend",

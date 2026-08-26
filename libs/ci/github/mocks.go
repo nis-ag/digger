@@ -2,9 +2,16 @@ package github
 
 import (
 	"fmt"
-	"github.com/diggerhq/digger/libs/ci"
+	"slices"
 	"strconv"
+	"unicode/utf8"
+
+	"github.com/diggerhq/digger/libs/ci"
 )
+
+// Duplicated from reporting.GithubCommentMaxLength, which cannot be imported here: comment_utils
+// depends on this package.
+const githubCommentMaxLength = 65536
 
 type MockCiService struct {
 	CommentsPerPr map[int][]*ci.Comment
@@ -21,7 +28,11 @@ func (t MockCiService) GetApprovals(prNumber int) ([]string, error) {
 func (t MockCiService) GetChangedFiles(prNumber int) ([]string, error) {
 	return nil, nil
 }
+// GitHub answers an oversized body with a 422 and posts nothing.
 func (t MockCiService) PublishComment(prNumber int, comment string) (*ci.Comment, error) {
+	if utf8.RuneCountInString(comment) > githubCommentMaxLength {
+		return nil, fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", githubCommentMaxLength)
+	}
 
 	latestId := 0
 
@@ -34,9 +45,10 @@ func (t MockCiService) PublishComment(prNumber int, comment string) (*ci.Comment
 		}
 	}
 
-	t.CommentsPerPr[prNumber] = append(t.CommentsPerPr[prNumber], &ci.Comment{Id: strconv.Itoa(latestId + 1), Body: &comment})
+	newComment := &ci.Comment{Id: strconv.Itoa(latestId + 1), Body: &comment}
+	t.CommentsPerPr[prNumber] = append(t.CommentsPerPr[prNumber], newComment)
 
-	return &ci.Comment{Id: strconv.Itoa(latestId)}, nil
+	return newComment, nil
 }
 
 func (t MockCiService) ListIssues() ([]*ci.Issue, error) {
@@ -93,6 +105,9 @@ func (t MockCiService) GetComments(prNumber int) ([]ci.Comment, error) {
 }
 
 func (t MockCiService) EditComment(prNumber int, id string, comment string) error {
+	if utf8.RuneCountInString(comment) > githubCommentMaxLength {
+		return fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", githubCommentMaxLength)
+	}
 	for _, comments := range t.CommentsPerPr {
 		for _, c := range comments {
 			if c.Id == id {
@@ -105,6 +120,11 @@ func (t MockCiService) EditComment(prNumber int, id string, comment string) erro
 }
 
 func (t MockCiService) DeleteComment(id string) error {
+	for prNumber, comments := range t.CommentsPerPr {
+		t.CommentsPerPr[prNumber] = slices.DeleteFunc(comments, func(c *ci.Comment) bool {
+			return c.Id == id
+		})
+	}
 	return nil
 }
 

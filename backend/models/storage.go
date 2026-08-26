@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/diggerhq/digger/libs/digger_config/terragrunt/tac"
@@ -1310,6 +1311,83 @@ func (db *Database) UpdateDiggerJob(job *DiggerJob) error {
 		"id", job.ID,
 		"status", job.Status)
 	return nil
+}
+
+// CreatePlanCommentGroup records the comment a group of a batch's plans is rendered into. It is
+// keyed on (batch, group index) so a retried webhook reuses the existing comment instead of posting
+// a second one.
+func (db *Database) CreatePlanCommentGroup(batchId uuid.UUID, groupIndex int, commentId string, projects []string) (*DiggerPlanCommentGroup, error) {
+	serializedProjects, err := json.Marshal(projects)
+	if err != nil {
+		return nil, fmt.Errorf("could not serialize project names: %v", err)
+	}
+
+	group := &DiggerPlanCommentGroup{}
+	result := db.GormDB.
+		Where(DiggerPlanCommentGroup{BatchID: batchId.String(), GroupIndex: groupIndex}).
+		Attrs(DiggerPlanCommentGroup{CommentId: commentId, Projects: serializedProjects}).
+		FirstOrCreate(group)
+	if result.Error != nil {
+		slog.Error("failed to create plan comment group",
+			"batchId", batchId,
+			"groupIndex", groupIndex,
+			"error", result.Error)
+		return nil, result.Error
+	}
+	return group, nil
+}
+
+func (db *Database) GetPlanCommentGroupsForBatch(batchId uuid.UUID) ([]DiggerPlanCommentGroup, error) {
+	groups := make([]DiggerPlanCommentGroup, 0)
+	result := db.GormDB.
+		Where("batch_id = ?", batchId.String()).
+		Order("group_index").
+		Find(&groups)
+	if result.Error != nil {
+		slog.Error("failed to get plan comment groups for batch", "batchId", batchId, "error", result.Error)
+		return nil, result.Error
+	}
+	return groups, nil
+}
+
+// GetPlanCommentGroupForProject scans the batch's groups for the one holding projectName. A batch
+// has a handful of groups, so unmarshalling their project lists beats maintaining a join table.
+func (db *Database) GetPlanCommentGroupForProject(batchId uuid.UUID, projectName string) (*DiggerPlanCommentGroup, error) {
+	groups, err := db.GetPlanCommentGroupsForBatch(batchId)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, group := range groups {
+		var projects []string
+		if err := json.Unmarshal(group.Projects, &projects); err != nil {
+			return nil, fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
+		}
+		if slices.Contains(projects, projectName) {
+			return &group, nil
+		}
+	}
+	return nil, fmt.Errorf("no plan comment group of batch %v holds project %v", batchId, projectName)
+}
+
+// ClaimPlanCommentGroupRender reserves the right to render a group at the given terminal job count,
+// reporting false when a render covering at least as many jobs already landed. force skips the
+// guard, for the authoritative render at batch completion.
+func (db *Database) ClaimPlanCommentGroupRender(groupId uint, count int, force bool) (bool, error) {
+	query := db.GormDB.Model(&DiggerPlanCommentGroup{}).Where("id = ?", groupId)
+	if !force {
+		query = query.Where("rendered_job_count < ?", count)
+	}
+
+	result := query.Update("rendered_job_count", count)
+	if result.Error != nil {
+		slog.Error("failed to claim plan comment group render",
+			"groupId", groupId,
+			"count", count,
+			"error", result.Error)
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
 }
 
 func (db *Database) GetDiggerJobsForBatch(batchId uuid.UUID) ([]DiggerJob, error) {

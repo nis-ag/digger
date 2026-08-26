@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/diggerhq/digger/backend/models"
 	"github.com/diggerhq/digger/backend/utils"
+	"github.com/diggerhq/digger/libs/ci"
 	"github.com/diggerhq/digger/libs/ci/github"
+	"github.com/diggerhq/digger/libs/comment_utils/reporting"
 	"github.com/diggerhq/digger/libs/digger_config"
 	orchestrator_scheduler "github.com/diggerhq/digger/libs/scheduler"
 	"github.com/diggerhq/digger/libs/spec"
+	"github.com/google/uuid"
 )
 
 func IsDriftStatusJob(job *models.DiggerJob) (bool, error) {
@@ -592,4 +596,292 @@ func UpdateCheckRunForJob(gh utils.GithubClientProvider, job *models.DiggerJob, 
 		}
 	}
 	return nil
+}
+
+// reporterTypeForConfig decides whether the runner posts its own comments. accumulate_plans silences
+// it for a plan because the backend renders every plan into the group comments instead; any other
+// command has nothing accumulating it and keeps reporting for itself.
+func reporterTypeForConfig(config *digger_config.DiggerConfig, command orchestrator_scheduler.DiggerCommand) string {
+	if !config.Reporting.CommentsEnabled {
+		return "noop"
+	}
+	if config.CommentRenderMode == digger_config.CommentRenderModeAccumulatePlans &&
+		command == orchestrator_scheduler.DiggerCommandPlan {
+		return "noop"
+	}
+	return "lazy"
+}
+
+// CreatePlanCommentGroupsForBatch posts one placeholder comment per group before any job runs, so
+// no runner ever has to create a comment and there is no creation race. It is a no-op unless the
+// batch is a plan whose config asks for accumulate_plans.
+func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *models.DiggerBatch, config *digger_config.DiggerConfig, projectNames []string) error {
+	if config.CommentRenderMode != digger_config.CommentRenderModeAccumulatePlans ||
+		batch.BatchType != orchestrator_scheduler.DiggerCommandPlan {
+		return nil
+	}
+
+	// A redelivered webhook must reuse the comments the first delivery posted, otherwise the PR keeps
+	// a second set that nothing edits or deletes.
+	existing, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	if err != nil {
+		return fmt.Errorf("could not read the existing plan comment groups: %v", err)
+	}
+	alreadyPosted := make(map[int]bool, len(existing))
+	for _, group := range existing {
+		alreadyPosted[group.GroupIndex] = true
+	}
+
+	// Sorting is what makes group membership deterministic: the caller's project names come from a
+	// map, whose iteration order is not.
+	sorted := append([]string(nil), projectNames...)
+	sort.Strings(sorted)
+
+	offset := 0
+	for groupIndex, group := range reporting.ChunkProjects(sorted, config.Reporting.MaxPlansPerComment) {
+		if alreadyPosted[groupIndex] {
+			offset += len(group)
+			continue
+		}
+
+		plans := make([]reporting.AccumulatedPlan, 0, len(group))
+		for _, projectName := range group {
+			plans = append(plans, reporting.AccumulatedPlan{
+				ProjectName: projectName,
+				DisplayName: projectName,
+				Status:      orchestrator_scheduler.DiggerJobCreated,
+			})
+		}
+
+		header := reporting.PlanGroupHeader(offset, len(group), len(sorted))
+		comment, err := prService.PublishComment(batch.PrNumber, reporting.RenderAccumulatedPlans(header, plans))
+		if err != nil {
+			return fmt.Errorf("could not publish plan comment group %v: %v", groupIndex, err)
+		}
+
+		if _, err := models.DB.CreatePlanCommentGroup(batch.ID, groupIndex, comment.Id, group); err != nil {
+			return fmt.Errorf("could not persist plan comment group %v: %v", groupIndex, err)
+		}
+		offset += len(group)
+	}
+
+	slog.Info("created plan comment groups for batch",
+		"batchId", batch.ID,
+		"projectCount", len(sorted),
+		"maxPlansPerComment", config.Reporting.MaxPlansPerComment)
+	return nil
+}
+
+// RenderPlanCommentGroup rebuilds one group's comment from the database. force skips the monotonic
+// claim and is used by the batch-terminal render, which is authoritative.
+func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, group *models.DiggerPlanCommentGroup, force bool) error {
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	if err != nil {
+		return fmt.Errorf("could not get plan comment groups: %v", err)
+	}
+
+	offset, total, err := planGroupOffsetAndTotal(groups, group.GroupIndex)
+	if err != nil {
+		return err
+	}
+
+	var projectNames []string
+	if err := json.Unmarshal(group.Projects, &projectNames); err != nil {
+		return fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
+	}
+
+	jobs, err := models.DB.GetDiggerJobsForBatch(batch.ID)
+	if err != nil {
+		return fmt.Errorf("could not get jobs for batch: %v", err)
+	}
+	jobsByProject := make(map[string]models.DiggerJob, len(jobs))
+	for _, job := range jobs {
+		jobsByProject[job.ProjectName] = job
+	}
+
+	plans := make([]reporting.AccumulatedPlan, 0, len(projectNames))
+	terminalCount := 0
+	for _, projectName := range projectNames {
+		job, hasJob := jobsByProject[projectName]
+		if !hasJob {
+			plans = append(plans, reporting.AccumulatedPlan{
+				ProjectName: projectName,
+				DisplayName: projectName,
+				Status:      orchestrator_scheduler.DiggerJobCreated,
+			})
+			continue
+		}
+
+		if job.Status == orchestrator_scheduler.DiggerJobSucceeded || job.Status == orchestrator_scheduler.DiggerJobFailed {
+			terminalCount++
+		}
+		plans = append(plans, reporting.AccumulatedPlan{
+			ProjectName: projectName,
+			DisplayName: planDisplayName(job),
+			Status:      job.Status,
+			Output:      job.TerraformOutput,
+		})
+	}
+
+	claimed, err := models.DB.ClaimPlanCommentGroupRender(group.ID, terminalCount, force)
+	if err != nil {
+		return fmt.Errorf("could not claim render of plan comment group %v: %v", group.GroupIndex, err)
+	}
+	if !claimed {
+		slog.Info("skipping plan comment group render, a render covering at least as many jobs already landed",
+			"batchId", batch.ID,
+			"groupIndex", group.GroupIndex,
+			"terminalCount", terminalCount)
+		return nil
+	}
+
+	body := reporting.RenderAccumulatedPlans(reporting.PlanGroupHeader(offset, len(projectNames), total), plans)
+	if err := prService.EditComment(batch.PrNumber, group.CommentId, body); err != nil {
+		return fmt.Errorf("could not edit plan comment group %v: %v", group.GroupIndex, err)
+	}
+	return nil
+}
+
+func RenderAllPlanCommentGroups(prService ci.PullRequestService, batch *models.DiggerBatch) error {
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	if err != nil {
+		return fmt.Errorf("could not get plan comment groups: %v", err)
+	}
+
+	for _, group := range groups {
+		if err := RenderPlanCommentGroup(prService, batch, &group, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// planGroupOffsetAndTotal locates a group within its batch, so its header can name the slice of the
+// batch it covers.
+func planGroupOffsetAndTotal(groups []models.DiggerPlanCommentGroup, groupIndex int) (offset int, total int, err error) {
+	found := false
+	for _, group := range groups {
+		var projectNames []string
+		if err := json.Unmarshal(group.Projects, &projectNames); err != nil {
+			return 0, 0, fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
+		}
+		if group.GroupIndex < groupIndex {
+			offset += len(projectNames)
+		}
+		if group.GroupIndex == groupIndex {
+			found = true
+		}
+		total += len(projectNames)
+	}
+	if !found {
+		return 0, 0, fmt.Errorf("group %v is not part of its batch", groupIndex)
+	}
+	return offset, total, nil
+}
+
+// planDisplayName prefers the alias a reviewer recognises, falling back to the project name when the
+// job spec cannot be read.
+func planDisplayName(job models.DiggerJob) string {
+	serialized, err := job.MapToJsonStruct()
+	if err != nil {
+		return job.ProjectName
+	}
+	if alias := orchestrator_scheduler.GetProjectAlias(serialized); alias != "" {
+		return alias
+	}
+	return job.ProjectName
+}
+
+// allBatchJobsTerminal reports whether every job of the batch has finished. batch.Status cannot
+// answer this: UpdateBatchStatus only ever marks a batch succeeded, so a batch holding one failed
+// plan stays non-terminal forever.
+func allBatchJobsTerminal(batchId uuid.UUID) (bool, error) {
+	jobs, err := models.DB.GetDiggerJobsForBatch(batchId)
+	if err != nil {
+		return false, fmt.Errorf("could not get jobs for batch: %v", err)
+	}
+
+	for _, job := range jobs {
+		if job.Status != orchestrator_scheduler.DiggerJobSucceeded && job.Status != orchestrator_scheduler.DiggerJobFailed {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// commentRenderModeForBatch reads the render mode out of the config the batch was created with, so a
+// config change mid-flight cannot leave a batch half rendered one way and half the other.
+func commentRenderModeForBatch(batch *models.DiggerBatch) string {
+	configYml, err := digger_config.LoadDiggerConfigYamlFromString(batch.DiggerConfig)
+	if err != nil {
+		slog.Warn("Could not load the digger config of a batch, assuming the default render mode",
+			"batchId", batch.ID, "error", err)
+		return digger_config.CommentRenderModeBasic
+	}
+	if configYml.CommentRenderMode == nil {
+		return digger_config.CommentRenderModeBasic
+	}
+	return *configYml.CommentRenderMode
+}
+
+// renderPlanCommentGroupsForJob refreshes the group comment a finished job belongs to, then
+// re-renders every group once the whole batch has finished. The batch-terminal pass is the backstop:
+// intermediate renders can be refused by the monotonic claim, so only a forced pass guarantees a
+// complete final body.
+func renderPlanCommentGroupsForJob(gh utils.GithubClientProvider, batch *models.DiggerBatch, job *models.DiggerJob) {
+	if batch.BatchType != orchestrator_scheduler.DiggerCommandPlan ||
+		commentRenderModeForBatch(batch) != digger_config.CommentRenderModeAccumulatePlans {
+		return
+	}
+
+	prService, err := utils.GetPrServiceFromBatch(batch, gh)
+	if err != nil {
+		slog.Warn("Could not get PR service to render plan comment groups", "batchId", batch.ID, "error", err)
+		return
+	}
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, job.ProjectName)
+	if err != nil {
+		slog.Warn("Could not find plan comment group for project",
+			"batchId", batch.ID, "projectName", job.ProjectName, "error", err)
+	} else if err := RenderPlanCommentGroup(prService, batch, group, false); err != nil {
+		slog.Warn("Could not render plan comment group",
+			"batchId", batch.ID, "groupIndex", group.GroupIndex, "error", err)
+	}
+
+	batchFinished, err := allBatchJobsTerminal(batch.ID)
+	if err != nil {
+		slog.Warn("Could not tell whether the batch has finished", "batchId", batch.ID, "error", err)
+		return
+	}
+	if !batchFinished {
+		return
+	}
+
+	if err := RenderAllPlanCommentGroups(prService, batch); err != nil {
+		slog.Warn("Could not re-render plan comment groups at batch completion",
+			"batchId", batch.ID, "error", err)
+	}
+}
+
+// deletePlanCommentGroupsForBatch removes the group comments a previous plan batch rendered, so
+// delete_prior_comments keeps the PR from growing by one comment per group per run. It reports
+// whether every comment went, which is what the caller warns about.
+func deletePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *models.DiggerBatch) bool {
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	if err != nil {
+		slog.Warn("Could not get plan comment groups for batch", "batchId", batch.ID, "error", err)
+		return false
+	}
+
+	allDeleted := true
+	for _, group := range groups {
+		slog.Debug("Deleting plan comment group", "batchId", batch.ID, "commentID", group.CommentId)
+		if err := prService.DeleteComment(group.CommentId); err != nil {
+			slog.Warn("Could not delete plan comment group",
+				"batchId", batch.ID, "commentID", group.CommentId, "error", err)
+			allDeleted = false
+		}
+	}
+	return allDeleted
 }

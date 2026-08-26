@@ -31,8 +31,9 @@ type DiggerConfigYaml struct {
 }
 
 type ReportingConfigYaml struct {
-	AiSummary       bool `yaml:"ai_summary"`
-	CommentsEnabled bool `yaml:"comments_enabled"`
+	AiSummary          bool `yaml:"ai_summary"`
+	CommentsEnabled    bool `yaml:"comments_enabled"`
+	MaxPlansPerComment int  `yaml:"max_plans_per_comment"`
 }
 
 type DependencyConfigurationYaml struct {
@@ -208,6 +209,7 @@ func (c *ReportingConfigYaml) UnmarshalYAML(unmarshal func(any) error) error {
 	// set defaults
 	c.AiSummary = false
 	c.CommentsEnabled = true
+	c.MaxPlansPerComment = DefaultMaxPlansPerComment
 
 	// overlay YAML values
 	type plain ReportingConfigYaml
