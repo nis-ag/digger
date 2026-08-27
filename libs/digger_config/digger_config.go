@@ -775,9 +775,14 @@ func ValidateDiggerConfig(config *DiggerConfig) error {
 		return fmt.Errorf("invalid value for comment_render_mode, %v expecting one of %v", config.CommentRenderMode, strings.Join(validRenderModes, ", "))
 	}
 
-	if config.Reporting.MaxPlansPerComment < 1 {
+	// Bounded at both ends. Below 1 there is no grouping to describe. Above MaxPlansPerCommentLimit a
+	// comment cannot hold even the trimmer's floor for each plan, and the trimmer then falls back to
+	// cutting the untrimmed body: past roughly 810 plans all but the first few vanish and the survivor
+	// is left with an unterminated code fence and an unbalanced <details>, so the comment renders as
+	// one broken block.
+	if config.Reporting.MaxPlansPerComment < 1 || config.Reporting.MaxPlansPerComment > MaxPlansPerCommentLimit {
 		slog.Error("invalid max plans per comment", "value", config.Reporting.MaxPlansPerComment)
-		return fmt.Errorf("invalid value for reporting.max_plans_per_comment, %v: must be at least 1", config.Reporting.MaxPlansPerComment)
+		return fmt.Errorf("invalid value for reporting.max_plans_per_comment, %v: must be between 1 and %v", config.Reporting.MaxPlansPerComment, MaxPlansPerCommentLimit)
 	}
 
 	if config.CommentRenderMode == CommentRenderModeAccumulatePlans && !config.ReportTerraformOutputs {

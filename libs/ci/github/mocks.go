@@ -9,12 +9,14 @@ import (
 	"github.com/diggerhq/digger/libs/ci"
 )
 
-// Duplicated from reporting.GithubCommentMaxLength, which cannot be imported here: comment_utils
-// depends on this package.
-const githubCommentMaxLength = 65536
+const githubCommentMaxLength = ci.GithubCommentMaxLength
 
 type MockCiService struct {
 	CommentsPerPr map[int][]*ci.Comment
+}
+
+func NewMockCiService() MockCiService {
+	return MockCiService{CommentsPerPr: map[int][]*ci.Comment{}}
 }
 
 func (t MockCiService) GetUserTeams(organisation string, user string) ([]string, error) {
@@ -28,6 +30,7 @@ func (t MockCiService) GetApprovals(prNumber int) ([]string, error) {
 func (t MockCiService) GetChangedFiles(prNumber int) ([]string, error) {
 	return nil, nil
 }
+
 // GitHub answers an oversized body with a 422 and posts nothing.
 func (t MockCiService) PublishComment(prNumber int, comment string) (*ci.Comment, error) {
 	if utf8.RuneCountInString(comment) > githubCommentMaxLength {

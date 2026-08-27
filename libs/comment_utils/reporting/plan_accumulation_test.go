@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/diggerhq/digger/libs/scheduler"
@@ -12,7 +13,7 @@ import (
 )
 
 func succeededPlan(name, output string) AccumulatedPlan {
-	return AccumulatedPlan{ProjectName: name, DisplayName: name, Status: scheduler.DiggerJobSucceeded, Output: output}
+	return AccumulatedPlan{DisplayName: name, Status: scheduler.DiggerJobSucceeded, Output: output}
 }
 
 func TestChunkProjects(t *testing.T) {
@@ -68,6 +69,24 @@ func TestChunkProjects(t *testing.T) {
 				return
 			}
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// max_plans_per_comment reaches this from config. A size that never advances the window used to spin
+// forever appending empty groups, which takes the whole backend down instead of failing a request.
+func TestChunkProjectsRefusesANonPositiveSize(t *testing.T) {
+	for _, size := range []int{0, -1} {
+		t.Run(fmt.Sprintf("size %d", size), func(t *testing.T) {
+			done := make(chan [][]string, 1)
+			go func() { done <- ChunkProjects([]string{"a", "b", "c"}, size) }()
+
+			select {
+			case groups := <-done:
+				assert.Empty(t, groups, "a size below 1 cannot describe a grouping")
+			case <-time.After(2 * time.Second):
+				t.Fatal("ChunkProjects did not return: a non-positive size must not loop")
+			}
 		})
 	}
 }
@@ -132,9 +151,9 @@ func TestRenderAccumulatedPlansEmitsOneBlockPerSucceededPlan(t *testing.T) {
 func TestRenderAccumulatedPlansMarksFailedAndPendingPlans(t *testing.T) {
 	plans := []AccumulatedPlan{
 		succeededPlan("alpha", "alpha plan output"),
-		{ProjectName: "beta", DisplayName: "beta", Status: scheduler.DiggerJobFailed},
-		{ProjectName: "gamma", DisplayName: "gamma", Status: scheduler.DiggerJobCreated},
-		{ProjectName: "delta", DisplayName: "delta", Status: scheduler.DiggerJobSucceeded, Output: ""},
+		{DisplayName: "beta", Status: scheduler.DiggerJobFailed},
+		{DisplayName: "gamma", Status: scheduler.DiggerJobCreated},
+		{DisplayName: "delta", Status: scheduler.DiggerJobSucceeded, Output: ""},
 		succeededPlan("epsilon", "epsilon plan output"),
 	}
 
@@ -151,10 +170,36 @@ func TestRenderAccumulatedPlansMarksFailedAndPendingPlans(t *testing.T) {
 	assert.Equal(t, "epsilon plan output", blocks[1])
 }
 
+// "</details>" opens a CommonMark HTML block that closes only at a blank line, so a status line one
+// newline after a finished plan is swallowed into it and shown verbatim - no emoji, literal
+// asterisks. A group where one plan has landed and the rest have not is the normal in-progress state,
+// so this is what a reviewer sees for most of a run.
+func TestRenderAccumulatedPlansSeparatesSectionsWithABlankLine(t *testing.T) {
+	body := RenderAccumulatedPlans(PlanGroupHeader(0, 4, 4), []AccumulatedPlan{
+		succeededPlan("alpha", "alpha plan output"),
+		{DisplayName: "beta", Status: scheduler.DiggerJobCreated},
+		{DisplayName: "gamma", Status: scheduler.DiggerJobFailed},
+		{DisplayName: "delta", Status: scheduler.DiggerJobSucceeded},
+	})
+
+	require.Contains(t, body, "</details>", "the fixture must actually produce a collapsible plan")
+
+	// Every section must be separated from the previous one by a blank line, so no markdown line can
+	// land inside the HTML block a "</details>" opens.
+	assert.NotContains(t, body, "</details>\n:",
+		"a status line directly after </details> is absorbed into the raw HTML block")
+	assert.Contains(t, body, "</details>\n\n:hourglass_flowing_sand: **beta** - pending",
+		"the pending line must start its own markdown block")
+	assert.Contains(t, body, "\n\n:x: **gamma** - plan failed, see the job logs")
+	assert.Contains(t, body, "\n\n:white_check_mark: **delta** - plan complete, no output captured")
+	assert.Contains(t, body, PlanGroupHeader(0, 4, 4)+"\n\n<details",
+		"the header must not run into the first plan either")
+}
+
 func TestRenderAccumulatedPlansRendersAnAllPendingPlaceholder(t *testing.T) {
 	plans := []AccumulatedPlan{
-		{ProjectName: "alpha", DisplayName: "alpha", Status: scheduler.DiggerJobCreated},
-		{ProjectName: "beta", DisplayName: "beta", Status: scheduler.DiggerJobCreated},
+		{DisplayName: "alpha", Status: scheduler.DiggerJobCreated},
+		{DisplayName: "beta", Status: scheduler.DiggerJobCreated},
 	}
 
 	body := RenderAccumulatedPlans(PlanGroupHeader(0, 2, 2), plans)
@@ -168,7 +213,6 @@ func TestRenderAccumulatedPlansRendersAnAllPendingPlaceholder(t *testing.T) {
 func TestRenderAccumulatedPlansUsesTheProjectAlias(t *testing.T) {
 	plans := []AccumulatedPlan{
 		{
-			ProjectName: "customers_bkw_prod",
 			DisplayName: "bkw-prod",
 			Status:      scheduler.DiggerJobSucceeded,
 			Output:      "plan output",
@@ -190,8 +234,8 @@ func TestRenderAccumulatedPlansSatisfiesCommentInvariants(t *testing.T) {
 			name: "mixed statuses",
 			plans: []AccumulatedPlan{
 				succeededPlan("alpha", fixturePlanBlock(t)),
-				{ProjectName: "beta", DisplayName: "beta", Status: scheduler.DiggerJobFailed},
-				{ProjectName: "gamma", DisplayName: "gamma", Status: scheduler.DiggerJobCreated},
+				{DisplayName: "beta", Status: scheduler.DiggerJobFailed},
+				{DisplayName: "gamma", Status: scheduler.DiggerJobCreated},
 				succeededPlan("delta", fixturePlanBlock(t)),
 			},
 		},

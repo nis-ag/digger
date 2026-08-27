@@ -1743,6 +1743,32 @@ projects:
 	assert.ErrorContains(t, err, CommentRenderModeAccumulatePlans)
 }
 
+// Past roughly 810 plans a comment cannot hold even the trimmer's floor for each of them, and the
+// fallback cuts the untrimmed body: nearly every plan disappears and what is left has an unterminated
+// code fence. A value that can only produce a broken comment must not load.
+func TestMaxPlansPerCommentIsBoundedAbove(t *testing.T) {
+	atLimit := fmt.Sprintf(`
+reporting:
+  max_plans_per_comment: %d
+projects:
+- name: dev
+  dir: .
+`, MaxPlansPerCommentLimit)
+	dg, _, _, err := LoadDiggerConfigFromString(atLimit, "./")
+	assert.NoError(t, err, "the limit itself must be accepted")
+	assert.Equal(t, MaxPlansPerCommentLimit, dg.Reporting.MaxPlansPerComment)
+
+	overLimit := fmt.Sprintf(`
+reporting:
+  max_plans_per_comment: %d
+projects:
+- name: dev
+  dir: .
+`, MaxPlansPerCommentLimit+1)
+	_, _, _, err = LoadDiggerConfigFromString(overLimit, "./")
+	assert.ErrorContains(t, err, "max_plans_per_comment")
+}
+
 func TestMaxPlansPerCommentMustBePositive(t *testing.T) {
 	for _, value := range []string{"0", "-1"} {
 		t.Run(value, func(t *testing.T) {

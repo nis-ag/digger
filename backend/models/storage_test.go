@@ -369,7 +369,7 @@ func TestGetPlanCommentGroupForProject(t *testing.T) {
 	assert.Error(t, err, "an unknown project must not silently resolve to a group")
 }
 
-func TestRecordRenderAdvancesMonotonically(t *testing.T) {
+func TestClaimRenderAdvancesMonotonically(t *testing.T) {
 	teardownSuite, _, _ := setupSuite(t)
 	defer teardownSuite(t)
 
@@ -385,13 +385,75 @@ func TestRecordRenderAdvancesMonotonically(t *testing.T) {
 		return reloaded[0].RenderedJobCount
 	}
 
-	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 5))
+	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
+	require.NoError(t, err)
+	assert.True(t, claimed)
 	assert.Equal(t, 5, renderedJobCount())
 
-	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 4))
-	assert.Equal(t, 5, renderedJobCount(),
-		"a render of another process that read fewer terminal jobs must not walk the counter back")
+	// The claim is what orders two replicas: the one that read fewer terminal jobs has to be told no,
+	// because after it there is no second guard between it and the VCS.
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 4, false)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a render that read fewer terminal jobs must be refused")
+	assert.Equal(t, 5, renderedJobCount(), "and must not walk the counter back")
 
-	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 6))
-	assert.Equal(t, 6, renderedJobCount(), "a fresher render must move it on")
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 6, false)
+	require.NoError(t, err)
+	assert.True(t, claimed, "a fresher render must be admitted")
+	assert.Equal(t, 6, renderedJobCount())
+
+	// force is the batch-terminal render, which is authoritative, and is also how a failed edit hands
+	// its claim back.
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 2, true)
+	require.NoError(t, err)
+	assert.True(t, claimed, "force must not be refused by the guard")
+	assert.Equal(t, 2, renderedJobCount(), "force must be able to lower the counter again")
+}
+
+// A claim against a row that is gone must report that it did not get the claim, otherwise the caller
+// edits the comment believing the guard is live when it is not recording anything.
+func TestClaimRenderOfAMissingGroupIsNotGranted(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	claimed, err := DB.ClaimPlanCommentGroupRender(4242, 1, true)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+}
+
+// GORM omits zero-valued fields from a struct condition, so keying this lookup on a struct made group
+// index 0 match whatever row of the batch had the lowest id.
+func TestCreatePlanCommentGroupHonoursGroupIndexZero(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	_, err := DB.CreatePlanCommentGroup(batch.ID, 1, "comment-one", []string{"beta"})
+	require.NoError(t, err)
+
+	zero, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-zero", []string{"alpha"})
+	require.NoError(t, err)
+	assert.Equal(t, 0, zero.GroupIndex, "group 0 must not resolve to another group of the batch")
+	assert.Equal(t, "comment-zero", zero.CommentId)
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, stored, 2, "group 0 must be persisted even though 1 already existed")
+	assert.Equal(t, "comment-zero", stored[0].CommentId)
+	assert.Equal(t, "comment-one", stored[1].CommentId)
+}
+
+func TestDeletePlanCommentGroup(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
+	require.NoError(t, err)
+
+	require.NoError(t, DB.DeletePlanCommentGroup(group.ID))
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, stored, "a group whose comment is gone must not be found again")
 }

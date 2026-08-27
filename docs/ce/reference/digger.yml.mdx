@@ -223,7 +223,11 @@ workflows:
 </ParamField>
 
 <ParamField path="comment_render_mode" type="string" default="basic">
-  How to render plan output in comments. Options: `basic`, `detailed`.
+  How to render plan output in comments. Options: `basic`, `group_by_module`, `accumulate_plans`.
+
+  With `accumulate_plans` the backend collects the plans of a run into a small number of comments — up
+  to `reporting.max_plans_per_comment` plans each — instead of one comment per project. Requires
+  `report_terraform_outputs` to stay enabled, and is supported on GitHub only.
 </ParamField>
 
 <ParamField path="mention_drifted_projects_in_pr" type="boolean" default="false">
@@ -252,6 +256,11 @@ workflows:
 
 <ParamField path="reporting.comments_enabled" type="boolean" default="true">
   Enable posting plan/apply results as PR comments.
+</ParamField>
+
+<ParamField path="reporting.max_plans_per_comment" type="integer" default="8">
+  How many plans one comment holds under `comment_render_mode: accumulate_plans`. Must be at least 1,
+  and is ignored by the other render modes.
 </ParamField>
 
 <ParamField path="dependency_configuration.mode" type="string" default="hard">

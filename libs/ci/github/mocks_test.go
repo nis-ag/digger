@@ -4,18 +4,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/diggerhq/digger/libs/ci"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func newMockCiService() MockCiService {
-	return MockCiService{CommentsPerPr: map[int][]*ci.Comment{}}
-}
-
 func TestMockPublishCommentReturnsTheIdItStored(t *testing.T) {
-	svc := newMockCiService()
+	svc := NewMockCiService()
 
 	published, err := svc.PublishComment(1, "first")
 	require.NoError(t, err)
@@ -37,7 +32,7 @@ func TestMockPublishCommentReturnsTheIdItStored(t *testing.T) {
 }
 
 func TestMockPublishCommentIssuesDistinctIds(t *testing.T) {
-	svc := newMockCiService()
+	svc := NewMockCiService()
 
 	first, err := svc.PublishComment(1, "first")
 	require.NoError(t, err)
@@ -51,7 +46,7 @@ func TestMockPublishCommentIssuesDistinctIds(t *testing.T) {
 }
 
 func TestMockRejectsOversizedComments(t *testing.T) {
-	svc := newMockCiService()
+	svc := NewMockCiService()
 
 	existing, err := svc.PublishComment(1, "small enough")
 	require.NoError(t, err)
@@ -72,14 +67,14 @@ func TestMockRejectsOversizedComments(t *testing.T) {
 }
 
 func TestMockAcceptsACommentExactlyAtTheLimit(t *testing.T) {
-	svc := newMockCiService()
+	svc := NewMockCiService()
 
 	_, err := svc.PublishComment(1, strings.Repeat("x", githubCommentMaxLength))
 	assert.NoError(t, err, "the limit is inclusive")
 }
 
 func TestMockDeleteCommentRemovesIt(t *testing.T) {
-	svc := newMockCiService()
+	svc := NewMockCiService()
 
 	first, err := svc.PublishComment(1, "first")
 	require.NoError(t, err)

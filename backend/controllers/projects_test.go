@@ -326,7 +326,7 @@ func bodies(t *testing.T, svc github_ci.MockCiService, prNumber int) []string {
 }
 
 func newMockPrService() github_ci.MockCiService {
-	return github_ci.MockCiService{CommentsPerPr: map[int][]*ci.Comment{}}
+	return github_ci.NewMockCiService()
 }
 
 func TestCreatePlanCommentGroupsPostsOnePlaceholderPerGroup(t *testing.T) {
@@ -512,19 +512,23 @@ func planGroupsOfSizes(t *testing.T, sizes ...int) []models.DiggerPlanCommentGro
 	return groups
 }
 
-func TestPlanGroupOffsetAndTotal(t *testing.T) {
+func TestPlanGroupSlice(t *testing.T) {
 	groups := planGroupsOfSizes(t, 8, 8, 8, 2)
 
 	for groupIndex, wantOffset := range map[int]int{0: 0, 1: 8, 2: 16, 3: 24} {
-		offset, total, err := planGroupOffsetAndTotal(groups, groupIndex)
+		target, projectNames, offset, total, err := planGroupSlice(groups, groupIndex)
 		require.NoError(t, err)
+		require.NotNil(t, target)
+		assert.Equal(t, groupIndex, target.GroupIndex, "the group it returns must be the one asked for")
 		assert.Equal(t, wantOffset, offset, "group %v starts after every earlier group's projects", groupIndex)
 		assert.Equal(t, 26, total, "the total counts the whole batch, not the group")
+		assert.Equal(t, fmt.Sprintf("project-%02d", wantOffset), projectNames[0],
+			"the project list must be the group's own, decoded once")
 	}
 }
 
-func TestPlanGroupOffsetAndTotalRejectsAForeignGroup(t *testing.T) {
-	_, _, err := planGroupOffsetAndTotal(planGroupsOfSizes(t, 8, 8), 4)
+func TestPlanGroupSliceRejectsAForeignGroup(t *testing.T) {
+	_, _, _, _, err := planGroupSlice(planGroupsOfSizes(t, 8, 8), 4)
 	require.Error(t, err, "a group index the batch does not hold must not render as offset zero")
 	assert.Contains(t, err.Error(), "not part of its batch")
 }
@@ -799,6 +803,140 @@ func TestConcurrentRendersDoNotLeaveAStaleComment(t *testing.T) {
 	assert.Contains(t, body, "the plan for project-01")
 }
 
+// failingCommentService rejects edits of one comment id the way GitHub answers a comment that is gone.
+type failingCommentService struct {
+	github_ci.MockCiService
+	rejectId string
+}
+
+func (s *failingCommentService) EditComment(prNumber int, id string, body string) error {
+	if id == s.rejectId {
+		return fmt.Errorf("404 Not Found")
+	}
+	return s.MockCiService.EditComment(prNumber, id, body)
+}
+
+// The batch-terminal pass is the only forced render, so the groups after a transient failure need it
+// just as much as the ones before it. Giving up on the first error left them showing whatever an
+// earlier refused render happened to leave.
+func TestBatchCompletionRendersLaterGroupsAfterOneFails(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	inner := newMockPrService()
+	svc := &failingCommentService{MockCiService: inner}
+	projects := testProjectNames(26)
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), projects))
+
+	for _, name := range projects {
+		createTestJob(t, batch, name, "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for "+name)
+	}
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+	svc.rejectId = groups[0].CommentId
+
+	err = RenderAllPlanCommentGroups(svc, batch)
+	require.Error(t, err, "the group that could not be rendered must still be reported")
+
+	published := bodies(t, svc.MockCiService, 7)
+	require.Len(t, published, 4)
+	assert.NotContains(t, published[0], "the plan for project-00", "this group's edit was rejected")
+	for _, name := range projects[8:] {
+		assert.Contains(t, strings.Join(published[1:], "\n"), "the plan for "+name,
+			"a group after the failing one must still be rendered")
+	}
+}
+
+// A project with several impacted parents gets one job row per parent edge, and the rows come back
+// unordered. Picking whichever came last could hide a plan that had already finished.
+func TestRenderPrefersTheFinishedRowOfADuplicatedProject(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8),
+		[]string{"alpha", "beta"}))
+
+	createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for alpha")
+	// The second row of the same project, created later and still pending.
+	createTestJob(t, batch, "alpha", "", orchestrator_scheduler.DiggerJobCreated, "")
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "alpha")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+
+	assert.Contains(t, bodies(t, svc, 7)[0], "the plan for alpha",
+		"a finished job row must win over a sibling row that is still pending")
+}
+
+// The scheduler only starts a job once every parent has succeeded, so the children of a failed plan
+// stay in DiggerJobCreated for good. Requiring every job to have finished meant the authoritative
+// final render never ran for those batches.
+func TestBatchIsFinishedWhenAFailedPlanStrandsItsChildren(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	createTestJob(t, batch, "parent", "", orchestrator_scheduler.DiggerJobFailed, "")
+	stranded := createTestJob(t, batch, "child", "", orchestrator_scheduler.DiggerJobCreated, "")
+
+	done, err := allBatchJobsTerminal(batch.ID)
+	require.NoError(t, err)
+	assert.True(t, done, "a job that can never be scheduled must not hold the batch open forever")
+
+	// A job that is still genuinely running must, though.
+	stranded.Status = orchestrator_scheduler.DiggerJobStarted
+	require.NoError(t, models.DB.UpdateDiggerJob(stranded))
+
+	done, err = allBatchJobsTerminal(batch.ID)
+	require.NoError(t, err)
+	assert.False(t, done, "a running job means the batch is not finished")
+}
+
+// max_plans_per_comment reaches ChunkProjects from config, where a non-positive value used to hang the
+// webhook handler instead of failing it.
+func TestCreatePlanCommentGroupsRejectsANonPositiveMaxPerComment(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	config := accumulatePlansConfig(t, 8)
+	config.Reporting.MaxPlansPerComment = 0
+
+	err := CreatePlanCommentGroupsForBatch(svc, batch, config, testProjectNames(4))
+	require.Error(t, err, "an unusable group size must fail the request, not spin")
+	assert.Contains(t, err.Error(), "max_plans_per_comment")
+	assert.Empty(t, svc.CommentsPerPr[7])
+}
+
+// nilCommentService publishes without returning the comment, the way AzureReposService does.
+type nilCommentService struct {
+	github_ci.MockCiService
+}
+
+func (s *nilCommentService) PublishComment(prNumber int, comment string) (*ci.Comment, error) {
+	return nil, nil
+}
+
+// The returned comment id is the only handle later renders have, so a service that does not give one
+// has to be an error rather than a nil dereference in the webhook handler.
+func TestCreatePlanCommentGroupsFailsWhenNoCommentIdComesBack(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := &nilCommentService{MockCiService: newMockPrService()}
+
+	err := CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(4))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "without a comment id")
+}
+
 func TestBatchCompletionRerendersEveryGroup(t *testing.T) {
 	teardownSuite, _ := setupSuite(t)
 	defer teardownSuite(t)
@@ -1042,8 +1180,15 @@ func TestAllBatchJobsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, done, "a failed job is finished, and the batch status will never say so")
 
-	require.NotEqual(t, orchestrator_scheduler.BatchJobSucceeded, batch.Status,
-		"this is exactly the case batch.Status cannot detect")
+	// The claim this helper exists for. Asserting against the in-memory batch would prove nothing: it
+	// was never written to. Drive the real updater and re-read the row.
+	require.NoError(t, models.DB.UpdateBatchStatus(batch))
+	reloaded, err := models.DB.GetDiggerBatch(&batch.ID)
+	require.NoError(t, err)
+	assert.NotEqual(t, orchestrator_scheduler.BatchJobSucceeded, reloaded.Status,
+		"one job failed, so the batch must not be marked succeeded")
+	assert.NotEqual(t, orchestrator_scheduler.BatchJobFailed, reloaded.Status,
+		"UpdateBatchStatus never marks a batch failed, which is exactly why completion has to be derived from the jobs")
 }
 
 func TestDeletePlanCommentGroupsForBatch(t *testing.T) {

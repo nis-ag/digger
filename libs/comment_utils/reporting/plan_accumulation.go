@@ -5,24 +5,24 @@ import (
 	"strings"
 
 	"github.com/diggerhq/digger/libs/scheduler"
+	"github.com/samber/lo"
 )
 
-// AccumulatedPlan is one project's plan as the backend knows it: the project name it is keyed by,
-// the alias to show a reviewer, the job's current status and whatever output the runner sent back.
+// AccumulatedPlan is one project's plan as the backend knows it: the name to show a reviewer, the
+// job's current status and whatever output the runner sent back.
 type AccumulatedPlan struct {
-	ProjectName string
 	DisplayName string
 	Status      scheduler.DiggerJobStatus
 	Output      string
 }
 
-// ChunkProjects splits project names into groups of at most size, preserving order.
+// ChunkProjects splits project names into groups of at most size, preserving order. A size below 1
+// yields no groups rather than looping forever.
 func ChunkProjects(projects []string, size int) [][]string {
-	var groups [][]string
-	for start := 0; start < len(projects); start += size {
-		groups = append(groups, projects[start:min(start+size, len(projects))])
+	if size < 1 {
+		return nil
 	}
-	return groups
+	return lo.Chunk(projects, size)
 }
 
 // PlanGroupHeader labels a group by its position in the batch: offset is the index of the group's
@@ -46,11 +46,15 @@ func renderAccumulatedPlan(plan AccumulatedPlan) string {
 
 func renderAccumulatedPlans(header string, plans []AccumulatedPlan) string {
 	sections := make([]string, 0, len(plans)+1)
-	sections = append(sections, header+"\n")
+	sections = append(sections, header)
 	for _, plan := range plans {
 		sections = append(sections, renderAccumulatedPlan(plan))
 	}
-	return strings.Join(sections, "\n")
+	// Blank lines between sections, not single newlines. A succeeded plan ends in "</details>", which
+	// opens a CommonMark HTML block that closes only at a blank line, so a status line one newline
+	// later is swallowed into it and shown verbatim instead of rendered. This is why
+	// GetTerraformOutputAsCollapsibleComment already puts a blank line after "</summary>".
+	return strings.Join(sections, "\n\n")
 }
 
 // RenderAccumulatedPlans builds a whole comment body from database state. It is a full replacement,

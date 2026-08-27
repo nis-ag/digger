@@ -2,6 +2,11 @@ package ci
 
 import "strconv"
 
+// GithubCommentMaxLength is the longest body GitHub accepts on an issue or PR comment. It lives here
+// rather than in the reporting package so the GitHub service, its mock and the comment trimmer all
+// share one definition.
+const GithubCommentMaxLength = 65536
+
 type PullRequestService interface {
 	GetChangedFiles(prNumber int) ([]string, error)
 	PublishComment(prNumber int, comment string) (*Comment, error)

@@ -2,9 +2,11 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -623,8 +625,18 @@ func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 		return nil
 	}
 
-	// A redelivered webhook must reuse the comments the first delivery posted, otherwise the PR keeps
-	// a second set that nothing edits or deletes.
+	// ChunkProjects never advances on a non-positive size, so refuse it here rather than hang the
+	// handler. ValidateDiggerConfig rejects it too, but not every path that builds a DiggerConfig
+	// runs the validator.
+	maxPerComment := config.Reporting.MaxPlansPerComment
+	if maxPerComment < 1 {
+		return fmt.Errorf("reporting.max_plans_per_comment must be at least 1, got %v", maxPerComment)
+	}
+
+	// A second pass over the same batch must reuse the comments the first pass posted, otherwise the
+	// PR keeps a second set that nothing edits or deletes. Note this cannot dedupe a redelivered
+	// webhook: CreateDiggerBatch mints a fresh batch id per delivery, so a redelivery arrives here
+	// with an empty group set and does post a second set of comments.
 	existing, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
 	if err != nil {
 		return fmt.Errorf("could not read the existing plan comment groups: %v", err)
@@ -636,41 +648,43 @@ func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 
 	// Sorting is what makes group membership deterministic: the caller's project names come from a
 	// map, whose iteration order is not.
-	sorted := append([]string(nil), projectNames...)
+	sorted := slices.Clone(projectNames)
 	sort.Strings(sorted)
 
-	offset := 0
-	for groupIndex, group := range reporting.ChunkProjects(sorted, config.Reporting.MaxPlansPerComment) {
+	for groupIndex, group := range reporting.ChunkProjects(sorted, maxPerComment) {
 		if alreadyPosted[groupIndex] {
-			offset += len(group)
 			continue
 		}
 
 		plans := make([]reporting.AccumulatedPlan, 0, len(group))
 		for _, projectName := range group {
 			plans = append(plans, reporting.AccumulatedPlan{
-				ProjectName: projectName,
 				DisplayName: projectName,
 				Status:      orchestrator_scheduler.DiggerJobCreated,
 			})
 		}
 
-		header := reporting.PlanGroupHeader(offset, len(group), len(sorted))
+		// Chunks are uniform, so the group's first project sits at groupIndex * maxPerComment.
+		header := reporting.PlanGroupHeader(groupIndex*maxPerComment, len(group), len(sorted))
 		comment, err := prService.PublishComment(batch.PrNumber, reporting.RenderAccumulatedPlans(header, plans))
 		if err != nil {
 			return fmt.Errorf("could not publish plan comment group %v: %v", groupIndex, err)
+		}
+		// Not every PullRequestService returns the comment it created, and this one's id is the only
+		// handle later renders have.
+		if comment == nil {
+			return fmt.Errorf("plan comment group %v was published without a comment id", groupIndex)
 		}
 
 		if _, err := models.DB.CreatePlanCommentGroup(batch.ID, groupIndex, comment.Id, group); err != nil {
 			return fmt.Errorf("could not persist plan comment group %v: %v", groupIndex, err)
 		}
-		offset += len(group)
 	}
 
 	slog.Info("created plan comment groups for batch",
 		"batchId", batch.ID,
 		"projectCount", len(sorted),
-		"maxPlansPerComment", config.Reporting.MaxPlansPerComment)
+		"maxPlansPerComment", maxPerComment)
 	return nil
 }
 
@@ -688,40 +702,39 @@ func lockPlanCommentGroup(groupId uint) func() {
 }
 
 // RenderPlanCommentGroup rebuilds one group's comment from the database. force skips the check
-// against the last landed render and is used by the batch-terminal render, which is authoritative.
+// against the last claimed render and is used by the batch-terminal render, which is authoritative.
 func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, group *models.DiggerPlanCommentGroup, force bool) error {
-	unlock := lockPlanCommentGroup(group.ID)
-	defer unlock()
-
 	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
 	if err != nil {
 		return fmt.Errorf("could not get plan comment groups: %v", err)
 	}
-
-	offset, total, err := planGroupOffsetAndTotal(groups, group.GroupIndex)
-	if err != nil {
-		return err
-	}
-
-	// The caller's copy of the group can predate a render that has since landed.
-	renderedJobCount := 0
-	for _, stored := range groups {
-		if stored.GroupIndex == group.GroupIndex {
-			renderedJobCount = stored.RenderedJobCount
-		}
-	}
-
-	var projectNames []string
-	if err := json.Unmarshal(group.Projects, &projectNames); err != nil {
-		return fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
-	}
-
 	jobs, err := models.DB.GetDiggerJobsForBatch(batch.ID)
 	if err != nil {
 		return fmt.Errorf("could not get jobs for batch: %v", err)
 	}
+	return renderPlanCommentGroup(prService, batch, groups, jobs, group.GroupIndex, force)
+}
+
+// renderPlanCommentGroup rebuilds one group's comment from state the caller has already loaded, so
+// rendering every group of a batch reads the batch's groups and jobs once rather than once per group.
+func renderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, groups []models.DiggerPlanCommentGroup, jobs []models.DiggerJob, groupIndex int, force bool) error {
+	target, projectNames, offset, total, err := planGroupSlice(groups, groupIndex)
+	if err != nil {
+		return err
+	}
+
+	unlock := lockPlanCommentGroup(target.ID)
+	defer unlock()
+
 	jobsByProject := make(map[string]models.DiggerJob, len(jobs))
 	for _, job := range jobs {
+		// A project with several impacted parents gets one job row per parent edge, and the batch's
+		// jobs come back unordered, so pick deterministically and prefer a row that has finished:
+		// otherwise a completed plan can be hidden by a sibling row that is still pending, which also
+		// walks terminalCount backwards and lets the claim refuse the next legitimate render.
+		if existing, ok := jobsByProject[job.ProjectName]; ok && !planJobSupersedes(job, existing) {
+			continue
+		}
 		jobsByProject[job.ProjectName] = job
 	}
 
@@ -731,108 +744,149 @@ func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.Digge
 		job, hasJob := jobsByProject[projectName]
 		if !hasJob {
 			plans = append(plans, reporting.AccumulatedPlan{
-				ProjectName: projectName,
 				DisplayName: projectName,
 				Status:      orchestrator_scheduler.DiggerJobCreated,
 			})
 			continue
 		}
 
-		if job.Status == orchestrator_scheduler.DiggerJobSucceeded || job.Status == orchestrator_scheduler.DiggerJobFailed {
+		if planJobIsTerminal(job) {
 			terminalCount++
 		}
 		plans = append(plans, reporting.AccumulatedPlan{
-			ProjectName: projectName,
 			DisplayName: planDisplayName(job),
 			Status:      job.Status,
 			Output:      job.TerraformOutput,
 		})
 	}
 
-	if !force && terminalCount <= renderedJobCount {
-		slog.Info("skipping plan comment group render, a render covering at least as many jobs already landed",
+	// Claim before editing, not after. A guard written only once the edit has landed cannot refuse
+	// anything, so it could not order two renders of one group driven by different backend replicas -
+	// which the in-process lock above cannot do either.
+	previousCount := target.RenderedJobCount
+	claimed, err := models.DB.ClaimPlanCommentGroupRender(target.ID, terminalCount, force)
+	if err != nil {
+		return fmt.Errorf("could not claim the render of plan comment group %v: %v", groupIndex, err)
+	}
+	if !claimed {
+		slog.Info("skipping plan comment group render, a render covering at least as many jobs was already claimed",
 			"batchId", batch.ID,
-			"groupIndex", group.GroupIndex,
+			"groupIndex", groupIndex,
 			"terminalCount", terminalCount)
 		return nil
 	}
 
 	body := reporting.RenderAccumulatedPlans(reporting.PlanGroupHeader(offset, len(projectNames), total), plans)
-	if err := prService.EditComment(batch.PrNumber, group.CommentId, body); err != nil {
-		return fmt.Errorf("could not edit plan comment group %v: %v", group.GroupIndex, err)
-	}
-
-	if err := models.DB.RecordPlanCommentGroupRender(group.ID, terminalCount); err != nil {
-		return fmt.Errorf("could not record the render of plan comment group %v: %v", group.GroupIndex, err)
+	if err := prService.EditComment(batch.PrNumber, target.CommentId, body); err != nil {
+		// The claim describes a body that never reached the VCS. Hand it back, so a retry of the same
+		// state is not refused as redundant.
+		if _, releaseErr := models.DB.ClaimPlanCommentGroupRender(target.ID, previousCount, true); releaseErr != nil {
+			slog.Warn("Could not release the claim of a plan comment group whose edit failed",
+				"batchId", batch.ID, "groupIndex", groupIndex, "error", releaseErr)
+		}
+		return fmt.Errorf("could not edit plan comment group %v: %v", groupIndex, err)
 	}
 	return nil
 }
 
+// RenderAllPlanCommentGroups re-renders every group of a batch. It does not stop at the first group
+// it cannot render: this is the authoritative pass, and the groups after a transient failure need it
+// just as much as the ones before it.
 func RenderAllPlanCommentGroups(prService ci.PullRequestService, batch *models.DiggerBatch) error {
 	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
 	if err != nil {
 		return fmt.Errorf("could not get plan comment groups: %v", err)
 	}
+	jobs, err := models.DB.GetDiggerJobsForBatch(batch.ID)
+	if err != nil {
+		return fmt.Errorf("could not get jobs for batch: %v", err)
+	}
 
+	var errs []error
 	for _, group := range groups {
-		if err := RenderPlanCommentGroup(prService, batch, &group, true); err != nil {
-			return err
+		if err := renderPlanCommentGroup(prService, batch, groups, jobs, group.GroupIndex, true); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// planGroupOffsetAndTotal locates a group within its batch, so its header can name the slice of the
-// batch it covers.
-func planGroupOffsetAndTotal(groups []models.DiggerPlanCommentGroup, groupIndex int) (offset int, total int, err error) {
-	found := false
-	for _, group := range groups {
-		var projectNames []string
-		if err := json.Unmarshal(group.Projects, &projectNames); err != nil {
-			return 0, 0, fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
+// planGroupSlice locates a group within its batch in one pass, returning its row and project list
+// alongside the offset and total its header must name, so no group's project list is decoded twice.
+func planGroupSlice(groups []models.DiggerPlanCommentGroup, groupIndex int) (target *models.DiggerPlanCommentGroup, projectNames []string, offset int, total int, err error) {
+	for i := range groups {
+		var names []string
+		if err := json.Unmarshal(groups[i].Projects, &names); err != nil {
+			return nil, nil, 0, 0, fmt.Errorf("could not deserialize project names of group %v: %v", groups[i].GroupIndex, err)
 		}
-		if group.GroupIndex < groupIndex {
-			offset += len(projectNames)
+		if groups[i].GroupIndex < groupIndex {
+			offset += len(names)
 		}
-		if group.GroupIndex == groupIndex {
-			found = true
+		if groups[i].GroupIndex == groupIndex {
+			target, projectNames = &groups[i], names
 		}
-		total += len(projectNames)
+		total += len(names)
 	}
-	if !found {
-		return 0, 0, fmt.Errorf("group %v is not part of its batch", groupIndex)
+	if target == nil {
+		return nil, nil, 0, 0, fmt.Errorf("group %v is not part of its batch", groupIndex)
 	}
-	return offset, total, nil
+	return target, projectNames, offset, total, nil
+}
+
+func planJobIsTerminal(job models.DiggerJob) bool {
+	return job.Status == orchestrator_scheduler.DiggerJobSucceeded || job.Status == orchestrator_scheduler.DiggerJobFailed
+}
+
+// planJobSupersedes orders two job rows of the same project: a finished row beats an unfinished one,
+// and the newer row breaks the tie.
+func planJobSupersedes(candidate models.DiggerJob, current models.DiggerJob) bool {
+	if planJobIsTerminal(candidate) != planJobIsTerminal(current) {
+		return planJobIsTerminal(candidate)
+	}
+	return candidate.ID > current.ID
 }
 
 // planDisplayName prefers the alias a reviewer recognises, falling back to the project name when the
-// job spec cannot be read.
+// job spec cannot be read. GetProjectAlias already falls back to the spec's project name.
 func planDisplayName(job models.DiggerJob) string {
 	serialized, err := job.MapToJsonStruct()
 	if err != nil {
 		return job.ProjectName
 	}
-	if alias := orchestrator_scheduler.GetProjectAlias(serialized); alias != "" {
-		return alias
-	}
-	return job.ProjectName
+	return orchestrator_scheduler.GetProjectAlias(serialized)
 }
 
-// allBatchJobsTerminal reports whether every job of the batch has finished. batch.Status cannot
-// answer this: UpdateBatchStatus only ever marks a batch succeeded, so a batch holding one failed
-// plan stays non-terminal forever.
+// allBatchJobsTerminal reports whether the batch can still make progress, which is what decides
+// whether the authoritative final render may run. batch.Status cannot answer it: UpdateBatchStatus
+// only ever marks a batch succeeded, so a batch holding one failed plan stays non-terminal forever.
+// "Every job has finished" cannot answer it either: services.DiggerJobCompleted schedules a child
+// only once every parent has succeeded, so the children of a failed plan sit in DiggerJobCreated for
+// good and a strict test would never let the final render run for them.
 func allBatchJobsTerminal(batchId uuid.UUID) (bool, error) {
 	jobs, err := models.DB.GetDiggerJobsForBatch(batchId)
 	if err != nil {
 		return false, fmt.Errorf("could not get jobs for batch: %v", err)
 	}
+	return batchJobsFinished(jobs), nil
+}
 
+func batchJobsFinished(jobs []models.DiggerJob) bool {
+	anyFailed, anyRunning, anyUnscheduled := false, false, false
 	for _, job := range jobs {
-		if job.Status != orchestrator_scheduler.DiggerJobSucceeded && job.Status != orchestrator_scheduler.DiggerJobFailed {
-			return false, nil
+		switch job.Status {
+		case orchestrator_scheduler.DiggerJobSucceeded:
+		case orchestrator_scheduler.DiggerJobFailed:
+			anyFailed = true
+		case orchestrator_scheduler.DiggerJobTriggered, orchestrator_scheduler.DiggerJobStarted, orchestrator_scheduler.DiggerJobQueuedForRun:
+			anyRunning = true
+		default:
+			anyUnscheduled = true
 		}
 	}
-	return true, nil
+	if anyRunning {
+		return false
+	}
+	return !anyUnscheduled || anyFailed
 }
 
 // commentRenderModeForBatch reads the render mode out of the config the batch was created with, so a
@@ -857,6 +911,19 @@ func commentRenderModeForBatch(batch *models.DiggerBatch) string {
 func renderPlanCommentGroupsForJob(gh utils.GithubClientProvider, batch *models.DiggerBatch, job *models.DiggerJob) {
 	if batch.BatchType != orchestrator_scheduler.DiggerCommandPlan ||
 		commentRenderModeForBatch(batch) != digger_config.CommentRenderModeAccumulatePlans {
+		return
+	}
+
+	// Look the groups up before building a PR service: getting one mints a GitHub App installation
+	// token. A batch can legitimately have no groups - comments_enabled off, a VCS this feature is not
+	// wired into, or a batch created before it shipped - and none of those should pay for a token or
+	// log a warning on every job status update.
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	if err != nil {
+		slog.Warn("Could not get plan comment groups", "batchId", batch.ID, "error", err)
+		return
+	}
+	if len(groups) == 0 {
 		return
 	}
 
@@ -907,6 +974,14 @@ func deletePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 			slog.Warn("Could not delete plan comment group",
 				"batchId", batch.ID, "commentID", group.CommentId, "error", err)
 			allDeleted = false
+			continue
+		}
+		// Drop the row along with the comment. Every later plan batch of this PR walks the same prior
+		// batches, so a row left behind means re-deleting a comment that is already gone, a 404, and a
+		// "some of the previous comments failed to delete" warning on every run from here on.
+		if err := models.DB.DeletePlanCommentGroup(group.ID); err != nil {
+			slog.Warn("Could not delete plan comment group row",
+				"batchId", batch.ID, "groupId", group.ID, "error", err)
 		}
 	}
 	return allDeleted
