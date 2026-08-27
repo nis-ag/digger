@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/diggerhq/digger/backend/models"
@@ -399,6 +402,26 @@ func TestPlanCommentGroupsAreNotCreatedForApplyBatches(t *testing.T) {
 		"an apply has no plans to accumulate, and its output does not belong under a plan header")
 }
 
+// reporting.comments_enabled switches plan and apply comments off. Under accumulate_plans the
+// backend is the one posting them, so the setting has to be honoured here as well - otherwise it
+// only silences the runner.
+func TestPlanCommentGroupsAreNotCreatedWhenCommentsAreDisabled(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := newMockPrService()
+	commentsOff := loadTestConfig(t,
+		"comment_render_mode: accumulate_plans\nreporting:\n  comments_enabled: false\nprojects:\n- name: dev\n  dir: .\n")
+
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, commentsOff, testProjectNames(4)))
+
+	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, groups)
+	assert.Empty(t, svc.CommentsPerPr[7], "comments_enabled: false must silence the backend, not just the runner")
+}
+
 // GitHub redelivers a webhook whose handler it did not hear back from. Publishing before persisting
 // leaves the PR with a second set of group comments that nothing ever edits or deletes.
 func TestCreatePlanCommentGroupsDoesNotPostTwiceForOneBatch(t *testing.T) {
@@ -662,6 +685,118 @@ func TestStaleRenderDoesNotOverwriteAFresherOne(t *testing.T) {
 	assert.Equal(t, 3, strings.Count(body, "```terraform"),
 		"a stale render must not drop a plan that already reached the comment")
 	assert.Contains(t, body, "the plan for project-02")
+}
+
+// flakyEditService rejects the first edit the way a transient GitHub error does.
+type flakyEditService struct {
+	github_ci.MockCiService
+	failNextEdit bool
+}
+
+func (s *flakyEditService) EditComment(prNumber int, id string, body string) error {
+	if s.failNextEdit {
+		s.failNextEdit = false
+		return fmt.Errorf("502 Bad Gateway")
+	}
+	return s.MockCiService.EditComment(prNumber, id, body)
+}
+
+// An edit that never reached GitHub rendered nothing, so the next render of the same state must
+// still be allowed to try again.
+func TestRenderPlanCommentGroupRetriesAfterAFailedEdit(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := &flakyEditService{MockCiService: newMockPrService(), failNextEdit: true}
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(2)))
+
+	createTestJob(t, batch, "project-00", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-00")
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+
+	require.Error(t, RenderPlanCommentGroup(svc, batch, group, false), "a failed edit must be reported")
+
+	reloaded, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+	require.NoError(t, RenderPlanCommentGroup(svc, batch, reloaded, false))
+
+	assert.Contains(t, bodies(t, svc.MockCiService, 7)[0], "the plan for project-00",
+		"the retry of a render that never landed must not be refused as redundant")
+}
+
+// pausingEditService holds the first edit inside the service until the test releases it, so that two
+// renders of one group overlap the way two job completions do.
+type pausingEditService struct {
+	github_ci.MockCiService
+	edits      atomic.Int32
+	firstEdit  chan struct{}
+	release    chan struct{}
+	secondEdit chan struct{}
+	seenSecond sync.Once
+}
+
+func (s *pausingEditService) EditComment(prNumber int, id string, body string) error {
+	if s.edits.Add(1) == 1 {
+		close(s.firstEdit)
+		<-s.release
+		return s.MockCiService.EditComment(prNumber, id, body)
+	}
+
+	err := s.MockCiService.EditComment(prNumber, id, body)
+	s.seenSecond.Do(func() { close(s.secondEdit) })
+	return err
+}
+
+// Two jobs of one group finishing at once put two renders on the same comment. The database counter
+// alone cannot order them: it is written before the edit reaches GitHub, so the render that read
+// fewer finished jobs can still land last and drop a plan that was already published.
+func TestConcurrentRendersDoNotLeaveAStaleComment(t *testing.T) {
+	teardownSuite, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t, 7)
+	svc := &pausingEditService{
+		MockCiService: newMockPrService(),
+		firstEdit:     make(chan struct{}),
+		release:       make(chan struct{}),
+		secondEdit:    make(chan struct{}),
+	}
+	require.NoError(t, CreatePlanCommentGroupsForBatch(svc, batch, accumulatePlansConfig(t, 8), testProjectNames(2)))
+
+	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, "project-00")
+	require.NoError(t, err)
+
+	createTestJob(t, batch, "project-00", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-00")
+	var renders sync.WaitGroup
+	renders.Add(1)
+	go func() {
+		defer renders.Done()
+		assert.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+	}()
+	<-svc.firstEdit
+
+	// The second job finishes while the first render is still in flight.
+	createTestJob(t, batch, "project-01", "", orchestrator_scheduler.DiggerJobSucceeded, "the plan for project-01")
+	renders.Add(1)
+	go func() {
+		defer renders.Done()
+		assert.NoError(t, RenderPlanCommentGroup(svc, batch, group, false))
+	}()
+
+	// Either the second render edits while the first is paused, or it is waiting for the first to
+	// finish. Both are legitimate; only the comment the pair leaves behind matters.
+	select {
+	case <-svc.secondEdit:
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(svc.release)
+	renders.Wait()
+
+	body := bodies(t, svc.MockCiService, 7)[0]
+	assert.Equal(t, 2, strings.Count(body, "```terraform"),
+		"the render that read fewer finished jobs must not land on top of a fresher one")
+	assert.Contains(t, body, "the plan for project-01")
 }
 
 func TestBatchCompletionRerendersEveryGroup(t *testing.T) {

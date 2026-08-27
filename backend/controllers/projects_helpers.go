@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -614,9 +615,10 @@ func reporterTypeForConfig(config *digger_config.DiggerConfig, command orchestra
 
 // CreatePlanCommentGroupsForBatch posts one placeholder comment per group before any job runs, so
 // no runner ever has to create a comment and there is no creation race. It is a no-op unless the
-// batch is a plan whose config asks for accumulate_plans.
+// batch is a plan whose config asks for accumulate_plans and allows comments at all.
 func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *models.DiggerBatch, config *digger_config.DiggerConfig, projectNames []string) error {
-	if config.CommentRenderMode != digger_config.CommentRenderModeAccumulatePlans ||
+	if !config.Reporting.CommentsEnabled ||
+		config.CommentRenderMode != digger_config.CommentRenderModeAccumulatePlans ||
 		batch.BatchType != orchestrator_scheduler.DiggerCommandPlan {
 		return nil
 	}
@@ -672,9 +674,25 @@ func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 	return nil
 }
 
-// RenderPlanCommentGroup rebuilds one group's comment from the database. force skips the monotonic
-// claim and is used by the batch-terminal render, which is authoritative.
+// planCommentGroupLocks serialises the renders of one group. The counter in the group's row cannot
+// do it alone: it is only written once the edit has landed, so two overlapping renders would both
+// pass its guard and could then reach the VCS in either order. Striped rather than one lock per
+// group, so the table cannot grow with every group the process ever renders; sharing a lock only
+// costs two unrelated groups a serialised edit. A second backend replica falls back to the counter.
+var planCommentGroupLocks [64]sync.Mutex
+
+func lockPlanCommentGroup(groupId uint) func() {
+	lock := &planCommentGroupLocks[groupId%uint(len(planCommentGroupLocks))]
+	lock.Lock()
+	return lock.Unlock
+}
+
+// RenderPlanCommentGroup rebuilds one group's comment from the database. force skips the check
+// against the last landed render and is used by the batch-terminal render, which is authoritative.
 func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, group *models.DiggerPlanCommentGroup, force bool) error {
+	unlock := lockPlanCommentGroup(group.ID)
+	defer unlock()
+
 	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
 	if err != nil {
 		return fmt.Errorf("could not get plan comment groups: %v", err)
@@ -683,6 +701,14 @@ func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.Digge
 	offset, total, err := planGroupOffsetAndTotal(groups, group.GroupIndex)
 	if err != nil {
 		return err
+	}
+
+	// The caller's copy of the group can predate a render that has since landed.
+	renderedJobCount := 0
+	for _, stored := range groups {
+		if stored.GroupIndex == group.GroupIndex {
+			renderedJobCount = stored.RenderedJobCount
+		}
 	}
 
 	var projectNames []string
@@ -723,11 +749,7 @@ func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.Digge
 		})
 	}
 
-	claimed, err := models.DB.ClaimPlanCommentGroupRender(group.ID, terminalCount, force)
-	if err != nil {
-		return fmt.Errorf("could not claim render of plan comment group %v: %v", group.GroupIndex, err)
-	}
-	if !claimed {
+	if !force && terminalCount <= renderedJobCount {
 		slog.Info("skipping plan comment group render, a render covering at least as many jobs already landed",
 			"batchId", batch.ID,
 			"groupIndex", group.GroupIndex,
@@ -738,6 +760,10 @@ func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.Digge
 	body := reporting.RenderAccumulatedPlans(reporting.PlanGroupHeader(offset, len(projectNames), total), plans)
 	if err := prService.EditComment(batch.PrNumber, group.CommentId, body); err != nil {
 		return fmt.Errorf("could not edit plan comment group %v: %v", group.GroupIndex, err)
+	}
+
+	if err := models.DB.RecordPlanCommentGroupRender(group.ID, terminalCount); err != nil {
+		return fmt.Errorf("could not record the render of plan comment group %v: %v", group.GroupIndex, err)
 	}
 	return nil
 }

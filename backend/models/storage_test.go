@@ -369,7 +369,7 @@ func TestGetPlanCommentGroupForProject(t *testing.T) {
 	assert.Error(t, err, "an unknown project must not silently resolve to a group")
 }
 
-func TestClaimRenderAdvancesMonotonically(t *testing.T) {
+func TestRecordRenderAdvancesMonotonically(t *testing.T) {
 	teardownSuite, _, _ := setupSuite(t)
 	defer teardownSuite(t)
 
@@ -378,42 +378,20 @@ func TestClaimRenderAdvancesMonotonically(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, group)
 
-	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
-	require.NoError(t, err)
-	assert.True(t, claimed, "the first render must be allowed to claim")
+	renderedJobCount := func() int {
+		reloaded, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+		require.NoError(t, err)
+		require.Len(t, reloaded, 1)
+		return reloaded[0].RenderedJobCount
+	}
 
-	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 4, false)
-	require.NoError(t, err)
-	assert.False(t, claimed, "a render computed from fewer terminal jobs must not overwrite a fresher one")
+	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 5))
+	assert.Equal(t, 5, renderedJobCount())
 
-	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
-	require.NoError(t, err)
-	assert.False(t, claimed, "re-rendering the same state is redundant work")
+	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 4))
+	assert.Equal(t, 5, renderedJobCount(),
+		"a render of another process that read fewer terminal jobs must not walk the counter back")
 
-	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 6, false)
-	require.NoError(t, err)
-	assert.True(t, claimed, "a fresher render must be allowed through")
-
-	reloaded, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
-	require.NoError(t, err)
-	require.Len(t, reloaded, 1)
-	assert.Equal(t, 6, reloaded[0].RenderedJobCount, "a rejected claim must not move the counter")
-}
-
-func TestClaimRenderForceOverridesTheGuard(t *testing.T) {
-	teardownSuite, _, _ := setupSuite(t)
-	defer teardownSuite(t)
-
-	batch := createTestBatch(t)
-	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
-	require.NoError(t, err)
-	require.NotNil(t, group)
-
-	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
-	require.NoError(t, err)
-	require.True(t, claimed)
-
-	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 5, true)
-	require.NoError(t, err)
-	assert.True(t, claimed, "the batch-terminal render is authoritative and must always land")
+	require.NoError(t, DB.RecordPlanCommentGroupRender(group.ID, 6))
+	assert.Equal(t, 6, renderedJobCount(), "a fresher render must move it on")
 }

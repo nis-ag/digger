@@ -104,8 +104,8 @@ type DiggerPlanCommentGroup struct {
 	CommentId  string
 	// JSON array of project names, in render order.
 	Projects []byte
-	// Terminal job count covered by the last render that reached the VCS. A render only claims the
-	// group by advancing this, so a slow render cannot overwrite a fresher one.
+	// Terminal job count covered by the last render that reached the VCS. A render that would not
+	// add to it is skipped, so a slow render cannot overwrite a fresher one.
 	RenderedJobCount int
 }
 
