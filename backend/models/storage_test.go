@@ -349,26 +349,6 @@ func TestPlanCommentGroupsOfDifferentBatchesAreIndependent(t *testing.T) {
 	assert.Equal(t, "comment-second", secondGroups[0].CommentId)
 }
 
-func TestGetPlanCommentGroupForProject(t *testing.T) {
-	teardownSuite, _, _ := setupSuite(t)
-	defer teardownSuite(t)
-
-	batch := createTestBatch(t)
-	_, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha", "beta"})
-	require.NoError(t, err)
-	_, err = DB.CreatePlanCommentGroup(batch.ID, 1, "comment-1", []string{"gamma", "delta"})
-	require.NoError(t, err)
-
-	group, err := DB.GetPlanCommentGroupForProject(batch.ID, "delta")
-	require.NoError(t, err)
-	require.NotNil(t, group)
-	assert.Equal(t, 1, group.GroupIndex)
-	assert.Equal(t, "comment-1", group.CommentId)
-
-	_, err = DB.GetPlanCommentGroupForProject(batch.ID, "unknown")
-	assert.Error(t, err, "an unknown project must not silently resolve to a group")
-}
-
 func TestClaimRenderAdvancesMonotonically(t *testing.T) {
 	teardownSuite, _, _ := setupSuite(t)
 	defer teardownSuite(t)

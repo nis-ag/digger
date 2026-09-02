@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/diggerhq/digger/libs/scheduler"
@@ -14,98 +13,6 @@ import (
 
 func succeededPlan(name, output string) AccumulatedPlan {
 	return AccumulatedPlan{DisplayName: name, Status: scheduler.DiggerJobSucceeded, Output: output}
-}
-
-func TestChunkProjects(t *testing.T) {
-	tests := []struct {
-		name     string
-		projects []string
-		size     int
-		want     [][]string
-	}{
-		{
-			name:     "a full batch splits into equal groups with a short tail",
-			projects: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"},
-			size:     4,
-			want:     [][]string{{"a", "b", "c", "d"}, {"e", "f", "g", "h"}, {"i", "j"}},
-		},
-		{
-			name:     "an exact multiple leaves no empty trailing group",
-			projects: []string{"a", "b", "c", "d"},
-			size:     4,
-			want:     [][]string{{"a", "b", "c", "d"}},
-		},
-		{
-			name:     "fewer projects than the limit gives one short group",
-			projects: []string{"a", "b", "c"},
-			size:     8,
-			want:     [][]string{{"a", "b", "c"}},
-		},
-		{
-			name:     "a limit of one gives one group per project",
-			projects: []string{"a", "b", "c"},
-			size:     1,
-			want:     [][]string{{"a"}, {"b"}, {"c"}},
-		},
-		{
-			name:     "no projects gives no groups",
-			projects: []string{},
-			size:     8,
-			want:     nil,
-		},
-		{
-			name:     "input order is preserved rather than sorted",
-			projects: []string{"c", "a", "b"},
-			size:     2,
-			want:     [][]string{{"c", "a"}, {"b"}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ChunkProjects(tt.projects, tt.size)
-			if tt.want == nil {
-				assert.Empty(t, got)
-				return
-			}
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-// max_plans_per_comment reaches this from config. A size that never advances the window used to spin
-// forever appending empty groups, which takes the whole backend down instead of failing a request.
-func TestChunkProjectsRefusesANonPositiveSize(t *testing.T) {
-	for _, size := range []int{0, -1} {
-		t.Run(fmt.Sprintf("size %d", size), func(t *testing.T) {
-			done := make(chan [][]string, 1)
-			go func() { done <- ChunkProjects([]string{"a", "b", "c"}, size) }()
-
-			select {
-			case groups := <-done:
-				assert.Empty(t, groups, "a size below 1 cannot describe a grouping")
-			case <-time.After(2 * time.Second):
-				t.Fatal("ChunkProjects did not return: a non-positive size must not loop")
-			}
-		})
-	}
-}
-
-func TestChunkProjectsCoversEveryProjectExactlyOnce(t *testing.T) {
-	projects := make([]string, 26)
-	for i := range projects {
-		projects[i] = fmt.Sprintf("project-%02d", i)
-	}
-
-	groups := ChunkProjects(projects, 8)
-	require.Len(t, groups, 4)
-
-	var flattened []string
-	for _, group := range groups {
-		assert.LessOrEqual(t, len(group), 8)
-		flattened = append(flattened, group...)
-	}
-	assert.Equal(t, projects, flattened)
 }
 
 func TestPlanGroupHeader(t *testing.T) {
@@ -160,7 +67,7 @@ func TestRenderAccumulatedPlansMarksFailedAndPendingPlans(t *testing.T) {
 	body := RenderAccumulatedPlans(PlanGroupHeader(0, 5, 5), plans)
 
 	assert.Contains(t, body, ":x: **beta** - plan failed, see the job logs")
-	assert.Contains(t, body, ":hourglass_flowing_sand: **gamma** - pending")
+	assert.Contains(t, body, ":clock11: **gamma** - pending")
 	assert.Contains(t, body, ":white_check_mark: **delta** - plan complete, no output captured")
 
 	// A plan without output must not swallow the blocks around it.
@@ -188,7 +95,7 @@ func TestRenderAccumulatedPlansSeparatesSectionsWithABlankLine(t *testing.T) {
 	// land inside the HTML block a "</details>" opens.
 	assert.NotContains(t, body, "</details>\n:",
 		"a status line directly after </details> is absorbed into the raw HTML block")
-	assert.Contains(t, body, "</details>\n\n:hourglass_flowing_sand: **beta** - pending",
+	assert.Contains(t, body, "</details>\n\n:clock11: **beta** - pending",
 		"the pending line must start its own markdown block")
 	assert.Contains(t, body, "\n\n:x: **gamma** - plan failed, see the job logs")
 	assert.Contains(t, body, "\n\n:white_check_mark: **delta** - plan complete, no output captured")
@@ -204,8 +111,8 @@ func TestRenderAccumulatedPlansRendersAnAllPendingPlaceholder(t *testing.T) {
 
 	body := RenderAccumulatedPlans(PlanGroupHeader(0, 2, 2), plans)
 
-	assert.Contains(t, body, ":hourglass_flowing_sand: **alpha** - pending")
-	assert.Contains(t, body, ":hourglass_flowing_sand: **beta** - pending")
+	assert.Contains(t, body, ":clock11: **alpha** - pending")
+	assert.Contains(t, body, ":clock11: **beta** - pending")
 	_, blocks := splitTerraformBlocks(body)
 	assert.Empty(t, blocks)
 }

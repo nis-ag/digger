@@ -205,11 +205,16 @@ type TerragruntParsingConfig struct {
 	DependsOnOrdering              *bool                       `yaml:"dependsOnOrdering,omitempty"`
 }
 
+func defaultReportingConfigYaml() ReportingConfigYaml {
+	return ReportingConfigYaml{
+		AiSummary:          false,
+		CommentsEnabled:    true,
+		MaxPlansPerComment: DefaultMaxPlansPerComment,
+	}
+}
+
 func (c *ReportingConfigYaml) UnmarshalYAML(unmarshal func(any) error) error {
-	// set defaults
-	c.AiSummary = false
-	c.CommentsEnabled = true
-	c.MaxPlansPerComment = DefaultMaxPlansPerComment
+	*c = defaultReportingConfigYaml()
 
 	// overlay YAML values
 	type plain ReportingConfigYaml

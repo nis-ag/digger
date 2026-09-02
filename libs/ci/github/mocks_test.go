@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/diggerhq/digger/libs/ci"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -51,7 +52,7 @@ func TestMockRejectsOversizedComments(t *testing.T) {
 	existing, err := svc.PublishComment(1, "small enough")
 	require.NoError(t, err)
 
-	oversized := strings.Repeat("x", githubCommentMaxLength+1)
+	oversized := strings.Repeat("x", ci.GithubCommentMaxLength+1)
 
 	_, err = svc.PublishComment(1, oversized)
 	assert.Error(t, err, "GitHub answers an oversized body with a 422")
@@ -69,7 +70,7 @@ func TestMockRejectsOversizedComments(t *testing.T) {
 func TestMockAcceptsACommentExactlyAtTheLimit(t *testing.T) {
 	svc := NewMockCiService()
 
-	_, err := svc.PublishComment(1, strings.Repeat("x", githubCommentMaxLength))
+	_, err := svc.PublishComment(1, strings.Repeat("x", ci.GithubCommentMaxLength))
 	assert.NoError(t, err, "the limit is inclusive")
 }
 

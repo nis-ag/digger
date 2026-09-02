@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/diggerhq/digger/libs/scheduler"
-	"github.com/samber/lo"
 )
 
 // AccumulatedPlan is one project's plan as the backend knows it: the name to show a reviewer, the
@@ -16,15 +15,6 @@ type AccumulatedPlan struct {
 	Output      string
 }
 
-// ChunkProjects splits project names into groups of at most size, preserving order. A size below 1
-// yields no groups rather than looping forever.
-func ChunkProjects(projects []string, size int) [][]string {
-	if size < 1 {
-		return nil
-	}
-	return lo.Chunk(projects, size)
-}
-
 // PlanGroupHeader labels a group by its position in the batch: offset is the index of the group's
 // first project, count its project count, total the batch's project count.
 func PlanGroupHeader(offset, count, total int) string {
@@ -32,15 +22,24 @@ func PlanGroupHeader(offset, count, total int) string {
 }
 
 func renderAccumulatedPlan(plan AccumulatedPlan) string {
-	switch {
-	case plan.Status == scheduler.DiggerJobSucceeded && plan.Output != "":
+	if plan.Status == scheduler.DiggerJobSucceeded && plan.Output != "" {
 		return GetTerraformOutputAsCollapsibleComment("Plan for "+plan.DisplayName, false)(plan.Output)
-	case plan.Status == scheduler.DiggerJobSucceeded:
-		return ":white_check_mark: **" + plan.DisplayName + "** - plan complete, no output captured"
-	case plan.Status == scheduler.DiggerJobFailed:
-		return ":x: **" + plan.DisplayName + "** - plan failed, see the job logs"
+	}
+	// ToEmoji keeps this comment's markers the same as the ones the check run summary uses for the
+	// same job status, so one PR does not show a project as pending in two different alphabets.
+	return plan.Status.ToEmoji() + " **" + plan.DisplayName + "** - " + planStatusNote(plan.Status)
+}
+
+func planStatusNote(status scheduler.DiggerJobStatus) string {
+	switch status {
+	case scheduler.DiggerJobSucceeded:
+		return "plan complete, no output captured"
+	case scheduler.DiggerJobFailed:
+		return "plan failed, see the job logs"
+	case scheduler.DiggerJobStarted, scheduler.DiggerJobTriggered:
+		return "planning"
 	default:
-		return ":hourglass_flowing_sand: **" + plan.DisplayName + "** - pending"
+		return "pending"
 	}
 }
 

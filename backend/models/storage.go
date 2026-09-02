@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/diggerhq/digger/libs/digger_config/terragrunt/tac"
@@ -1355,26 +1354,6 @@ func (db *Database) GetPlanCommentGroupsForBatch(batchId uuid.UUID) ([]DiggerPla
 		return nil, result.Error
 	}
 	return groups, nil
-}
-
-// GetPlanCommentGroupForProject scans the batch's groups for the one holding projectName. A batch
-// has a handful of groups, so unmarshalling their project lists beats maintaining a join table.
-func (db *Database) GetPlanCommentGroupForProject(batchId uuid.UUID, projectName string) (*DiggerPlanCommentGroup, error) {
-	groups, err := db.GetPlanCommentGroupsForBatch(batchId)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, group := range groups {
-		var projects []string
-		if err := json.Unmarshal(group.Projects, &projects); err != nil {
-			return nil, fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
-		}
-		if slices.Contains(projects, projectName) {
-			return &group, nil
-		}
-	}
-	return nil, fmt.Errorf("no plan comment group of batch %v holds project %v", batchId, projectName)
 }
 
 // DeletePlanCommentGroup forgets a group whose comment is gone, so nothing tries to delete or edit it

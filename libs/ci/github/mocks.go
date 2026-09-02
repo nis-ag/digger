@@ -9,8 +9,6 @@ import (
 	"github.com/diggerhq/digger/libs/ci"
 )
 
-const githubCommentMaxLength = ci.GithubCommentMaxLength
-
 type MockCiService struct {
 	CommentsPerPr map[int][]*ci.Comment
 }
@@ -33,8 +31,8 @@ func (t MockCiService) GetChangedFiles(prNumber int) ([]string, error) {
 
 // GitHub answers an oversized body with a 422 and posts nothing.
 func (t MockCiService) PublishComment(prNumber int, comment string) (*ci.Comment, error) {
-	if utf8.RuneCountInString(comment) > githubCommentMaxLength {
-		return nil, fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", githubCommentMaxLength)
+	if utf8.RuneCountInString(comment) > ci.GithubCommentMaxLength {
+		return nil, fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", ci.GithubCommentMaxLength)
 	}
 
 	latestId := 0
@@ -108,8 +106,8 @@ func (t MockCiService) GetComments(prNumber int) ([]ci.Comment, error) {
 }
 
 func (t MockCiService) EditComment(prNumber int, id string, comment string) error {
-	if utf8.RuneCountInString(comment) > githubCommentMaxLength {
-		return fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", githubCommentMaxLength)
+	if utf8.RuneCountInString(comment) > ci.GithubCommentMaxLength {
+		return fmt.Errorf("422 Unprocessable Entity: Body is too long (maximum is %d characters)", ci.GithubCommentMaxLength)
 	}
 	for _, comments := range t.CommentsPerPr {
 		for _, c := range comments {

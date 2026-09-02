@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 	orchestrator_scheduler "github.com/diggerhq/digger/libs/scheduler"
 	"github.com/diggerhq/digger/libs/spec"
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 )
 
 func IsDriftStatusJob(job *models.DiggerJob) (bool, error) {
@@ -625,9 +625,9 @@ func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 		return nil
 	}
 
-	// ChunkProjects never advances on a non-positive size, so refuse it here rather than hang the
-	// handler. ValidateDiggerConfig rejects it too, but not every path that builds a DiggerConfig
-	// runs the validator.
+	// lo.Chunk panics on a non-positive size, so refuse it here rather than take the handler down.
+	// ValidateDiggerConfig rejects it too, but not every path that builds a DiggerConfig runs the
+	// validator.
 	maxPerComment := config.Reporting.MaxPlansPerComment
 	if maxPerComment < 1 {
 		return fmt.Errorf("reporting.max_plans_per_comment must be at least 1, got %v", maxPerComment)
@@ -649,9 +649,9 @@ func CreatePlanCommentGroupsForBatch(prService ci.PullRequestService, batch *mod
 	// Sorting is what makes group membership deterministic: the caller's project names come from a
 	// map, whose iteration order is not.
 	sorted := slices.Clone(projectNames)
-	sort.Strings(sorted)
+	slices.Sort(sorted)
 
-	for groupIndex, group := range reporting.ChunkProjects(sorted, maxPerComment) {
+	for groupIndex, group := range lo.Chunk(sorted, maxPerComment) {
 		if alreadyPosted[groupIndex] {
 			continue
 		}
@@ -701,23 +701,11 @@ func lockPlanCommentGroup(groupId uint) func() {
 	return lock.Unlock
 }
 
-// RenderPlanCommentGroup rebuilds one group's comment from the database. force skips the check
-// against the last claimed render and is used by the batch-terminal render, which is authoritative.
-func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, group *models.DiggerPlanCommentGroup, force bool) error {
-	groups, err := models.DB.GetPlanCommentGroupsForBatch(batch.ID)
-	if err != nil {
-		return fmt.Errorf("could not get plan comment groups: %v", err)
-	}
-	jobs, err := models.DB.GetDiggerJobsForBatch(batch.ID)
-	if err != nil {
-		return fmt.Errorf("could not get jobs for batch: %v", err)
-	}
-	return renderPlanCommentGroup(prService, batch, groups, jobs, group.GroupIndex, force)
-}
-
-// renderPlanCommentGroup rebuilds one group's comment from state the caller has already loaded, so
+// RenderPlanCommentGroup rebuilds one group's comment from state the caller has already loaded, so
 // rendering every group of a batch reads the batch's groups and jobs once rather than once per group.
-func renderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, groups []models.DiggerPlanCommentGroup, jobs []models.DiggerJob, groupIndex int, force bool) error {
+// force skips the check against the last claimed render and is used by the batch-terminal render,
+// which is authoritative.
+func RenderPlanCommentGroup(prService ci.PullRequestService, batch *models.DiggerBatch, groups []models.DiggerPlanCommentGroup, jobs []models.DiggerJob, groupIndex int, force bool) error {
 	target, projectNames, offset, total, err := planGroupSlice(groups, groupIndex)
 	if err != nil {
 		return err
@@ -804,11 +792,26 @@ func RenderAllPlanCommentGroups(prService ci.PullRequestService, batch *models.D
 
 	var errs []error
 	for _, group := range groups {
-		if err := renderPlanCommentGroup(prService, batch, groups, jobs, group.GroupIndex, true); err != nil {
+		if err := RenderPlanCommentGroup(prService, batch, groups, jobs, group.GroupIndex, true); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// planGroupIndexForProject finds the group holding projectName among the groups the caller has already
+// loaded. A batch has a handful of groups, so decoding their project lists beats a join table.
+func planGroupIndexForProject(groups []models.DiggerPlanCommentGroup, projectName string) (int, error) {
+	for _, group := range groups {
+		var projects []string
+		if err := json.Unmarshal(group.Projects, &projects); err != nil {
+			return 0, fmt.Errorf("could not deserialize project names of group %v: %v", group.GroupIndex, err)
+		}
+		if slices.Contains(projects, projectName) {
+			return group.GroupIndex, nil
+		}
+	}
+	return 0, fmt.Errorf("no plan comment group holds project %v", projectName)
 }
 
 // planGroupSlice locates a group within its batch in one pass, returning its row and project list
@@ -933,15 +936,27 @@ func renderPlanCommentGroupsForJob(gh utils.GithubClientProvider, batch *models.
 		return
 	}
 
-	group, err := models.DB.GetPlanCommentGroupForProject(batch.ID, job.ProjectName)
+	// Read the jobs after the PR service, not before: minting the installation token takes a round trip,
+	// and every job that finishes during it would otherwise be missing from this render.
+	jobs, err := models.DB.GetDiggerJobsForBatch(batch.ID)
+	if err != nil {
+		slog.Warn("Could not get jobs for batch", "batchId", batch.ID, "error", err)
+		return
+	}
+
+	groupIndex, err := planGroupIndexForProject(groups, job.ProjectName)
 	if err != nil {
 		slog.Warn("Could not find plan comment group for project",
 			"batchId", batch.ID, "projectName", job.ProjectName, "error", err)
-	} else if err := RenderPlanCommentGroup(prService, batch, group, false); err != nil {
+	} else if err := RenderPlanCommentGroup(prService, batch, groups, jobs, groupIndex, false); err != nil {
 		slog.Warn("Could not render plan comment group",
-			"batchId", batch.ID, "groupIndex", group.GroupIndex, "error", err)
+			"batchId", batch.ID, "groupIndex", groupIndex, "error", err)
 	}
 
+	// Deliberately a fresh read rather than the snapshot above: the render just spent a round trip on
+	// the VCS, and a sibling job that finished during it must count here. Whichever handler sees the
+	// last job is the only one that runs the authoritative pass, so a stale snapshot can skip it
+	// entirely.
 	batchFinished, err := allBatchJobsTerminal(batch.ID)
 	if err != nil {
 		slog.Warn("Could not tell whether the batch has finished", "batchId", batch.ID, "error", err)
