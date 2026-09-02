@@ -31,8 +31,9 @@ type DiggerConfigYaml struct {
 }
 
 type ReportingConfigYaml struct {
-	AiSummary       bool `yaml:"ai_summary"`
-	CommentsEnabled bool `yaml:"comments_enabled"`
+	AiSummary          bool `yaml:"ai_summary"`
+	CommentsEnabled    bool `yaml:"comments_enabled"`
+	MaxPlansPerComment int  `yaml:"max_plans_per_comment"`
 }
 
 type DependencyConfigurationYaml struct {
@@ -204,10 +205,16 @@ type TerragruntParsingConfig struct {
 	DependsOnOrdering              *bool                       `yaml:"dependsOnOrdering,omitempty"`
 }
 
+func defaultReportingConfigYaml() ReportingConfigYaml {
+	return ReportingConfigYaml{
+		AiSummary:          false,
+		CommentsEnabled:    true,
+		MaxPlansPerComment: DefaultMaxPlansPerComment,
+	}
+}
+
 func (c *ReportingConfigYaml) UnmarshalYAML(unmarshal func(any) error) error {
-	// set defaults
-	c.AiSummary = false
-	c.CommentsEnabled = true
+	*c = defaultReportingConfigYaml()
 
 	// overlay YAML values
 	type plain ReportingConfigYaml

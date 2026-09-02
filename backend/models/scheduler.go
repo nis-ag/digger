@@ -95,6 +95,20 @@ type DiggerJob struct {
 	ReporterType string `gorm:"default:'lazy'"` // temporary, to be replaced by SerializedReporterSpec
 }
 
+// DiggerPlanCommentGroup is one PR comment holding up to reporting.max_plans_per_comment of a
+// batch's plans, used by the accumulate_plans render mode.
+type DiggerPlanCommentGroup struct {
+	gorm.Model
+	BatchID    string `gorm:"size:36;uniqueIndex:idx_plan_comment_group_batch_index,priority:1"`
+	GroupIndex int    `gorm:"uniqueIndex:idx_plan_comment_group_batch_index,priority:2"`
+	CommentId  string
+	// JSON array of project names, in render order.
+	Projects []byte
+	// Terminal job count covered by the last render that reached the VCS. A render that would not
+	// add to it is skipped, so a slow render cannot overwrite a fresher one.
+	RenderedJobCount int
+}
+
 type DiggerJobSummary struct {
 	gorm.Model
 	ResourcesCreated uint

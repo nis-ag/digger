@@ -1,12 +1,15 @@
 package models
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/diggerhq/digger/libs/scheduler"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -35,7 +38,8 @@ func setupSuite(tb testing.TB) (func(tb testing.TB), *Database, *Organisation) {
 	// migrate tables
 	err = gdb.AutoMigrate(&Policy{}, &Organisation{}, &Repo{}, &Project{}, &Token{},
 		&User{}, &ProjectRun{}, &GithubAppInstallation{}, &VCSConnection{}, &GithubAppInstallationLink{},
-		&GithubDiggerJobLink{}, &DiggerJob{}, &DiggerJobParentLink{}, &DiggerLock{})
+		&GithubDiggerJobLink{}, &DiggerJob{}, &DiggerJobParentLink{}, &DiggerLock{},
+		&DiggerBatch{}, &DiggerPlanCommentGroup{})
 	if err != nil {
 		panic(err)
 	}
@@ -267,4 +271,169 @@ func TestDiggerLockFunctionalities(t *testing.T) {
 	assert.Equal(t, 2, len(existingLocksAfterDeletion))
 	assert.Equal(t, "org/repo2#dev", existingLocksAfterDeletion[0].Resource)
 	assert.Equal(t, "org/repo2#prod", existingLocksAfterDeletion[1].Resource)
+}
+
+func createTestBatch(t *testing.T) *DiggerBatch {
+	t.Helper()
+	batch, err := DB.CreateDiggerBatch(DiggerVCSGithub, 1, "diggerhq", "digger", "diggerhq/digger", 42,
+		"", "main", scheduler.DiggerCommandPlan, nil, 0, "", true, false, nil, "abc123", nil, nil)
+	require.NoError(t, err)
+	return batch
+}
+
+func TestCreatePlanCommentGroups(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	groups := [][]string{
+		{"alpha", "beta"},
+		{"gamma", "delta"},
+		{"epsilon", "zeta"},
+		{"eta"},
+	}
+	for i, projects := range groups {
+		_, err := DB.CreatePlanCommentGroup(batch.ID, i, fmt.Sprintf("comment-%v", i), projects)
+		require.NoError(t, err)
+	}
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, stored, 4)
+
+	for i, group := range stored {
+		assert.Equal(t, i, group.GroupIndex, "groups must come back in group_index order")
+		assert.Equal(t, fmt.Sprintf("comment-%v", i), group.CommentId)
+
+		var projects []string
+		require.NoError(t, json.Unmarshal(group.Projects, &projects))
+		assert.Equal(t, groups[i], projects)
+	}
+}
+
+func TestCreatePlanCommentGroupsIsIdempotent(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	for range 2 {
+		for i, projects := range [][]string{{"alpha"}, {"beta"}} {
+			_, err := DB.CreatePlanCommentGroup(batch.ID, i, fmt.Sprintf("comment-%v", i), projects)
+			require.NoError(t, err)
+		}
+	}
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Len(t, stored, 2, "a retried webhook must not double-post comment groups")
+}
+
+func TestPlanCommentGroupsOfDifferentBatchesAreIndependent(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	first, second := createTestBatch(t), createTestBatch(t)
+	_, err := DB.CreatePlanCommentGroup(first.ID, 0, "comment-first", []string{"alpha"})
+	require.NoError(t, err)
+	_, err = DB.CreatePlanCommentGroup(second.ID, 0, "comment-second", []string{"alpha"})
+	require.NoError(t, err)
+
+	firstGroups, err := DB.GetPlanCommentGroupsForBatch(first.ID)
+	require.NoError(t, err)
+	require.Len(t, firstGroups, 1)
+	assert.Equal(t, "comment-first", firstGroups[0].CommentId)
+
+	secondGroups, err := DB.GetPlanCommentGroupsForBatch(second.ID)
+	require.NoError(t, err)
+	require.Len(t, secondGroups, 1)
+	assert.Equal(t, "comment-second", secondGroups[0].CommentId)
+}
+
+func TestClaimRenderAdvancesMonotonically(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
+	require.NoError(t, err)
+	require.NotNil(t, group)
+
+	renderedJobCount := func() int {
+		reloaded, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+		require.NoError(t, err)
+		require.Len(t, reloaded, 1)
+		return reloaded[0].RenderedJobCount
+	}
+
+	claimed, err := DB.ClaimPlanCommentGroupRender(group.ID, 5, false)
+	require.NoError(t, err)
+	assert.True(t, claimed)
+	assert.Equal(t, 5, renderedJobCount())
+
+	// The claim is what orders two replicas: the one that read fewer terminal jobs has to be told no,
+	// because after it there is no second guard between it and the VCS.
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 4, false)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a render that read fewer terminal jobs must be refused")
+	assert.Equal(t, 5, renderedJobCount(), "and must not walk the counter back")
+
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 6, false)
+	require.NoError(t, err)
+	assert.True(t, claimed, "a fresher render must be admitted")
+	assert.Equal(t, 6, renderedJobCount())
+
+	// force is the batch-terminal render, which is authoritative, and is also how a failed edit hands
+	// its claim back.
+	claimed, err = DB.ClaimPlanCommentGroupRender(group.ID, 2, true)
+	require.NoError(t, err)
+	assert.True(t, claimed, "force must not be refused by the guard")
+	assert.Equal(t, 2, renderedJobCount(), "force must be able to lower the counter again")
+}
+
+// A claim against a row that is gone must report that it did not get the claim, otherwise the caller
+// edits the comment believing the guard is live when it is not recording anything.
+func TestClaimRenderOfAMissingGroupIsNotGranted(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	claimed, err := DB.ClaimPlanCommentGroupRender(4242, 1, true)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+}
+
+// GORM omits zero-valued fields from a struct condition, so keying this lookup on a struct made group
+// index 0 match whatever row of the batch had the lowest id.
+func TestCreatePlanCommentGroupHonoursGroupIndexZero(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	_, err := DB.CreatePlanCommentGroup(batch.ID, 1, "comment-one", []string{"beta"})
+	require.NoError(t, err)
+
+	zero, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-zero", []string{"alpha"})
+	require.NoError(t, err)
+	assert.Equal(t, 0, zero.GroupIndex, "group 0 must not resolve to another group of the batch")
+	assert.Equal(t, "comment-zero", zero.CommentId)
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	require.Len(t, stored, 2, "group 0 must be persisted even though 1 already existed")
+	assert.Equal(t, "comment-zero", stored[0].CommentId)
+	assert.Equal(t, "comment-one", stored[1].CommentId)
+}
+
+func TestDeletePlanCommentGroup(t *testing.T) {
+	teardownSuite, _, _ := setupSuite(t)
+	defer teardownSuite(t)
+
+	batch := createTestBatch(t)
+	group, err := DB.CreatePlanCommentGroup(batch.ID, 0, "comment-0", []string{"alpha"})
+	require.NoError(t, err)
+
+	require.NoError(t, DB.DeletePlanCommentGroup(group.ID))
+
+	stored, err := DB.GetPlanCommentGroupsForBatch(batch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, stored, "a group whose comment is gone must not be found again")
 }

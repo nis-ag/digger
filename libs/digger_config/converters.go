@@ -197,15 +197,14 @@ func copyWorkflows(workflows map[string]*WorkflowYaml) map[string]Workflow {
 
 func copyReporterConfig(r *ReportingConfigYaml) ReporterConfig {
 	if r == nil {
-		return ReporterConfig{
-			AiSummary:       false,
-			CommentsEnabled: true,
-		}
+		defaults := defaultReportingConfigYaml()
+		r = &defaults
 	}
 
 	return ReporterConfig{
-		AiSummary:       r.AiSummary,
-		CommentsEnabled: r.CommentsEnabled,
+		AiSummary:          r.AiSummary,
+		CommentsEnabled:    r.CommentsEnabled,
+		MaxPlansPerComment: r.MaxPlansPerComment,
 	}
 
 }

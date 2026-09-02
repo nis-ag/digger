@@ -2,6 +2,14 @@ package digger_config
 
 const CommentRenderModeBasic = "basic"
 const CommentRenderModeGroupByModule = "group_by_module"
+const CommentRenderModeAccumulatePlans = "accumulate_plans"
+
+const DefaultMaxPlansPerComment = 8
+
+// MaxPlansPerCommentLimit caps reporting.max_plans_per_comment. One comment holds 65536 characters, so
+// packing more plans than this into it leaves every plan below the point where its output is worth
+// reading, and past roughly 810 the comment stops being valid markdown at all.
+const MaxPlansPerCommentLimit = 100
 
 type AutomergeStrategy string
 
@@ -37,8 +45,9 @@ type DiggerConfig struct {
 }
 
 type ReporterConfig struct {
-	AiSummary       bool
-	CommentsEnabled bool
+	AiSummary          bool
+	CommentsEnabled    bool
+	MaxPlansPerComment int
 }
 
 type DependencyConfiguration struct {

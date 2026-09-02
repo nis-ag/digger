@@ -741,16 +741,16 @@ func (db *Database) MakeGithubAppInstallationLinkInactive(link *GithubAppInstall
 	return link, nil
 }
 
-func (db *Database) CreateImpactedProject(repoFullName string, commitSha string, projcectName string, branch *string, prNumber *int) (*ImpactedProject,error) {
+func (db *Database) CreateImpactedProject(repoFullName string, commitSha string, projcectName string, branch *string, prNumber *int) (*ImpactedProject, error) {
 	ip := ImpactedProject{
-		ID:          uuid.New(),
+		ID:           uuid.New(),
 		RepoFullName: repoFullName,
 		CommitSha:    commitSha,
 		ProjectName:  projcectName,
-		Branch: branch,
-		PrNumber: prNumber,
-		Planned: false,
-		Applied: false,
+		Branch:       branch,
+		PrNumber:     prNumber,
+		Planned:      false,
+		Applied:      false,
 	}
 	err := db.GormDB.Create(&ip).Error
 	if err != nil {
@@ -1009,17 +1009,17 @@ func (db *Database) CreateDiggerJob(batchId uuid.UUID, serializedJob []byte, wor
 
 	workflowUrl := "#"
 	job := &DiggerJob{
-		DiggerJobID: jobId,
-		Status: scheduler.DiggerJobCreated,
-		ProjectName: projectName,
-		BatchID: &batchIdStr,
-		CheckRunId: checkRunId,
-		CheckRunUrl: checkRunUrl,
+		DiggerJobID:       jobId,
+		Status:            scheduler.DiggerJobCreated,
+		ProjectName:       projectName,
+		BatchID:           &batchIdStr,
+		CheckRunId:        checkRunId,
+		CheckRunUrl:       checkRunUrl,
 		SerializedJobSpec: serializedJob,
-		DiggerJobSummary: *summary,
-		WorkflowRunUrl: &workflowUrl,
-		WorkflowFile: workflowFile,
-		ReporterType: reporterType,
+		DiggerJobSummary:  *summary,
+		WorkflowRunUrl:    &workflowUrl,
+		WorkflowFile:      workflowFile,
+		ReporterType:      reporterType,
 	}
 	result = db.GormDB.Save(job)
 	if result.Error != nil {
@@ -1310,6 +1310,82 @@ func (db *Database) UpdateDiggerJob(job *DiggerJob) error {
 		"id", job.ID,
 		"status", job.Status)
 	return nil
+}
+
+// CreatePlanCommentGroup records the comment a group of a batch's plans is rendered into. It is
+// keyed on (batch, group index) so a retried webhook reuses the existing comment instead of posting
+// a second one.
+func (db *Database) CreatePlanCommentGroup(batchId uuid.UUID, groupIndex int, commentId string, projects []string) (*DiggerPlanCommentGroup, error) {
+	serializedProjects, err := json.Marshal(projects)
+	if err != nil {
+		return nil, fmt.Errorf("could not serialize project names: %v", err)
+	}
+
+	// The condition is spelled out in SQL rather than as a struct: GORM omits zero-valued fields from
+	// a struct condition, so group index 0 would degrade the key to batch_id alone and match whatever
+	// row of the batch has the lowest id.
+	group := &DiggerPlanCommentGroup{
+		BatchID:    batchId.String(),
+		GroupIndex: groupIndex,
+		CommentId:  commentId,
+		Projects:   serializedProjects,
+	}
+	result := db.GormDB.
+		Where("batch_id = ? AND group_index = ?", batchId.String(), groupIndex).
+		FirstOrCreate(group)
+	if result.Error != nil {
+		slog.Error("failed to create plan comment group",
+			"batchId", batchId,
+			"groupIndex", groupIndex,
+			"error", result.Error)
+		return nil, result.Error
+	}
+	return group, nil
+}
+
+func (db *Database) GetPlanCommentGroupsForBatch(batchId uuid.UUID) ([]DiggerPlanCommentGroup, error) {
+	groups := make([]DiggerPlanCommentGroup, 0)
+	result := db.GormDB.
+		Where("batch_id = ?", batchId.String()).
+		Order("group_index").
+		Find(&groups)
+	if result.Error != nil {
+		slog.Error("failed to get plan comment groups for batch", "batchId", batchId, "error", result.Error)
+		return nil, result.Error
+	}
+	return groups, nil
+}
+
+// DeletePlanCommentGroup forgets a group whose comment is gone, so nothing tries to delete or edit it
+// again.
+func (db *Database) DeletePlanCommentGroup(groupId uint) error {
+	result := db.GormDB.Delete(&DiggerPlanCommentGroup{}, groupId)
+	if result.Error != nil {
+		slog.Error("failed to delete plan comment group", "groupId", groupId, "error", result.Error)
+		return result.Error
+	}
+	return nil
+}
+
+// ClaimPlanCommentGroupRender reserves the right to render a group at the given terminal job count,
+// reporting false when a render covering at least as many jobs has already been claimed. The claim is
+// a single conditional UPDATE, so it also orders renders driven by different backend replicas, which
+// an in-process lock cannot. force skips the guard, for the authoritative render at batch completion.
+func (db *Database) ClaimPlanCommentGroupRender(groupId uint, count int, force bool) (bool, error) {
+	query := db.GormDB.Model(&DiggerPlanCommentGroup{}).Where("id = ?", groupId)
+	if !force {
+		query = query.Where("rendered_job_count < ?", count)
+	}
+
+	result := query.Update("rendered_job_count", count)
+	if result.Error != nil {
+		slog.Error("failed to claim plan comment group render",
+			"groupId", groupId,
+			"count", count,
+			"error", result.Error)
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
 }
 
 func (db *Database) GetDiggerJobsForBatch(batchId uuid.UUID) ([]DiggerJob, error) {

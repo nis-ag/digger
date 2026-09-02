@@ -8,6 +8,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/diggerhq/digger/libs/digger_config/terragrunt/tac"
@@ -766,11 +767,27 @@ func ValidateDiggerConfig(config *DiggerConfig) error {
 		return err
 	}
 
-	if config.CommentRenderMode != CommentRenderModeBasic && config.CommentRenderMode != CommentRenderModeGroupByModule {
+	validRenderModes := []string{CommentRenderModeBasic, CommentRenderModeGroupByModule, CommentRenderModeAccumulatePlans}
+	if !slices.Contains(validRenderModes, config.CommentRenderMode) {
 		slog.Error("invalid comment render mode",
 			"mode", config.CommentRenderMode,
-			"validModes", []string{string(CommentRenderModeBasic), string(CommentRenderModeGroupByModule)})
-		return fmt.Errorf("invalid value for comment_render_mode, %v expecting %v, %v", config.CommentRenderMode, CommentRenderModeBasic, CommentRenderModeGroupByModule)
+			"validModes", validRenderModes)
+		return fmt.Errorf("invalid value for comment_render_mode, %v expecting one of %v", config.CommentRenderMode, strings.Join(validRenderModes, ", "))
+	}
+
+	// Bounded at both ends. Below 1 there is no grouping to describe. Above MaxPlansPerCommentLimit a
+	// comment cannot hold even the trimmer's floor for each plan, and the trimmer then falls back to
+	// cutting the untrimmed body: past roughly 810 plans all but the first few vanish and the survivor
+	// is left with an unterminated code fence and an unbalanced <details>, so the comment renders as
+	// one broken block.
+	if config.Reporting.MaxPlansPerComment < 1 || config.Reporting.MaxPlansPerComment > MaxPlansPerCommentLimit {
+		slog.Error("invalid max plans per comment", "value", config.Reporting.MaxPlansPerComment)
+		return fmt.Errorf("invalid value for reporting.max_plans_per_comment, %v: must be between 1 and %v", config.Reporting.MaxPlansPerComment, MaxPlansPerCommentLimit)
+	}
+
+	if config.CommentRenderMode == CommentRenderModeAccumulatePlans && !config.ReportTerraformOutputs {
+		slog.Error("accumulate_plans requires terraform outputs to be reported")
+		return fmt.Errorf("comment_render_mode %v requires report_terraform_outputs to be enabled: the backend accumulates the plan output the runners send it", CommentRenderModeAccumulatePlans)
 	}
 
 	for _, p := range config.Projects {

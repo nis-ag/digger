@@ -495,10 +495,7 @@ func handlePullRequestEvent(gh utils.GithubClientProvider, payload *github.PullR
 		slog.Debug("Created AI summary comment", "commentId", aiSummaryCommentId)
 	}
 
-	reporterType := "lazy"
-	if config.Reporting.CommentsEnabled == false {
-		reporterType = "noop"
-	}
+	reporterType := reporterTypeForConfig(config, *diggerCommand)
 	slog.Info("Converting jobs to Digger jobs",
 		"prNumber", prNumber,
 		"command", *diggerCommand,
@@ -588,6 +585,16 @@ func handlePullRequestEvent(gh utils.GithubClientProvider, payload *github.PullR
 		}
 
 		slog.Debug("Successfully updated batch with source details", "batchId", batchId)
+	}
+
+	err = CreatePlanCommentGroupsForBatch(ghService, batch, config, lo.Keys(impactedJobsMap))
+	if err != nil {
+		slog.Error("Error creating plan comment groups",
+			"prNumber", prNumber,
+			"error", err,
+		)
+		commentReporterManager.UpdateComment(fmt.Sprintf(":x: could not create plan comment groups: %v", err))
+		return fmt.Errorf("error creating plan comment groups: %v", err)
 	}
 
 	segment.Track(*org, repoOwner, vcsActorId, "github", "backend_trigger_job", map[string]string{})

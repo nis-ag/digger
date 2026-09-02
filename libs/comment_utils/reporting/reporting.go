@@ -10,7 +10,7 @@ import (
 	"github.com/diggerhq/digger/libs/ci"
 )
 
-const GithubCommentMaxLength = 65536
+const GithubCommentMaxLength = ci.GithubCommentMaxLength
 
 const commentTruncationMarker = "\n\n[output truncated - see the linked full plan or the job logs]"
 
