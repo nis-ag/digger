@@ -35,15 +35,19 @@ const fixtureValidationCheckBody = "Terraform plan validation checks succeeded :
 // upsertComment accumulates only into a comment whose body contains the report title.
 const accumulatingTitle = "plan for shared-services"
 
-func planOutputSummary(project string) string {
-	return strings.ReplaceAll(fixturePlanOutputSummary, "shared-services", project)
+func planOutputSummary(project string, supportsMarkdown bool) string {
+	summary := fixturePlainPlanOutputSummary
+	if supportsMarkdown {
+		summary = fixturePlanOutputSummary
+	}
+	return strings.ReplaceAll(summary, "shared-services", project)
 }
 
 // The four reports production emits per project (see cli/pkg/digger/digger.go).
 func planReports(t testing.TB, project, planOutput string, supportsCollapsible bool) []report {
 	t.Helper()
 
-	summary := planOutputSummary(project)
+	summary := planOutputSummary(project, supportsCollapsible)
 	planFormatter := GetTerraformOutputAsComment(summary)
 	wrap := func(title string) func(string) string { return AsComment(title) }
 	if supportsCollapsible {
@@ -97,8 +101,14 @@ func replayLazy(t *testing.T, svc MockCiService, strategy ReportStrategy, report
 	return formatted
 }
 
-func assertPresignedPlanLinkSurvives(t *testing.T, body string) {
+func assertPresignedPlanLinkSurvives(t *testing.T, body string, supportsMarkdown bool) {
 	t.Helper()
+	if !supportsMarkdown {
+		assert.Contains(t, body, fixturePlainPlanOutputSummary)
+		assert.NotContains(t, body, fixtureEscapedPresignedPlanURL)
+		return
+	}
+
 	assert.Equal(t, fixturePresignedPlanURL, html.UnescapeString(fixtureEscapedPresignedPlanURL))
 	assert.Contains(t, body, `href="`+fixtureEscapedPresignedPlanURL+`"`)
 	assert.Contains(t, body, "full plan — valid for up to 1 hour")
@@ -287,7 +297,7 @@ func TestReferenceAccumulationKeepsEveryProtectedReport(t *testing.T) {
 	} {
 		assert.Contains(t, body, want)
 	}
-	assertPresignedPlanLinkSurvives(t, body)
+	assertPresignedPlanLinkSurvives(t, body, true)
 	assert.Equal(t, 3, strings.Count(body, "```bash"), "the three Instructions fences are protected prose")
 
 	_, blocks := splitTerraformBlocks(body)
@@ -655,7 +665,7 @@ func TestTrimmingHoldsAcrossStrategiesAndWrappers(t *testing.T) {
 							body := onlyBody(t, svc, 1)
 							assertCommentInvariants(t, body, collapsible)
 							assertProtectedTextSurvives(t, body, formatted)
-							assertPresignedPlanLinkSurvives(t, body)
+							assertPresignedPlanLinkSurvives(t, body, collapsible)
 							return
 						}
 
@@ -666,8 +676,9 @@ func TestTrimmingHoldsAcrossStrategiesAndWrappers(t *testing.T) {
 						for i, comment := range comments {
 							assertCommentInvariants(t, *comment.Body, collapsible)
 							assertProtectedTextSurvives(t, *comment.Body, []string{formatted[i]})
-							if strings.Contains(formatted[i], fixtureEscapedPresignedPlanURL) {
-								assertPresignedPlanLinkSurvives(t, *comment.Body)
+							if strings.Contains(formatted[i], fixtureEscapedPresignedPlanURL) ||
+								strings.Contains(formatted[i], fixturePresignedPlanURL) {
+								assertPresignedPlanLinkSurvives(t, *comment.Body, collapsible)
 							}
 						}
 					})
